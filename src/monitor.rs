@@ -27,6 +27,7 @@ use crate::index;
 // Event data management
 use crate::event;
 use event::Event;
+use crate::delivery;
 use crate::monitorevent::MonitorEvent;
 use crate::appevent::AppEvent;
 use crate::ruleset::*;
@@ -92,6 +93,15 @@ pub async fn monitor(
 
     // Check if we have to push index template
     push_template(destination.as_str(), cfg.clone()).await;
+
+    // Start the delivery retry loop, pending events are loaded from disk so
+    // they keep their batch and identity even after a restart.
+    match destination.as_str() {
+        appconfig::NETWORK_MODE | appconfig::BOTH_MODE => {
+            delivery::spawn_retry_loop(cfg.clone());
+        },
+        _ => debug!("Delivery retry loop not started in file mode")
+    }
 
     let mut watcher = MultiWatcher::new(cfg.clone().events_watcher.as_str(), tx);
     

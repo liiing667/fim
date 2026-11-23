@@ -23,6 +23,8 @@ mod event;
 mod monitorevent;
 mod appevent;
 mod ruleevent;
+// Persistent network delivery queue (batch, acks and retries)
+mod delivery;
 // File reading continuously
 mod logreader;
 mod auditevent;

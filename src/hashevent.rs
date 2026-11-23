@@ -7,14 +7,13 @@ pub const WRITE: &str = "WRITE";
 
 use crate::appconfig;
 use crate::appconfig::*;
+use crate::delivery;
 use crate::dbfile::*;
 
 use log::*;
 use std::fs::OpenOptions;
 use serde_json::{json, to_string};
 use std::io::Write;
-use reqwest::Client;
-use std::time::Duration;
 
 pub struct HashEvent {
     previous_dbfile: Option<DBFile>,
@@ -60,47 +59,23 @@ impl HashEvent {
         let index = format!("fim-{}-{}-{}", current_date.year(), current_date.month() as u8, current_date.day() );
 
         // Splunk endpoint integration
-        if cfg.endpoint_type == "Splunk" {
+        let (request_url, data) = if cfg.endpoint_type == "Splunk" {
             let data = json!({
-                "source": cfg.node,
+                "source": cfg.node.clone(),
                 "sourcetype": "_json",
                 "event": event,
                 "index": "fim_events"
             });
             debug!("Sending received event to Splunk integration, event: {}", data);
-            let request_url = format!("{}/services/collector/event", cfg.endpoint_address);
-            let client = Client::builder()
-                .danger_accept_invalid_certs(cfg.insecure)
-                .timeout(Duration::from_secs(30))
-                .build().unwrap();
-            match client
-                .post(request_url)
-                .header("Authorization", format!("Splunk {}", cfg.endpoint_token))
-                .json(&data)
-                .send()
-                .await {
-                    Ok(response) => debug!("Response received: {:?}",
-                        response.text().await.unwrap()),
-                    Err(e) => debug!("Error on request: {:?}", e)
-            }
+            (format!("{}/services/collector/event", cfg.endpoint_address), data)
         // Elastic endpoint integration
         } else {
-            let request_url = format!("{}/{}/_doc/{}", cfg.endpoint_address, index, self.dbfile.id);
-            let client = Client::builder()
-                .danger_accept_invalid_certs(cfg.insecure)
-                .timeout(Duration::from_secs(30))
-                .build().unwrap();
-            match client
-                .post(request_url)
-                .basic_auth(cfg.endpoint_user, Some(cfg.endpoint_pass))
-                .json(&event)
-                .send()
-                .await {
-                    Ok(response) => debug!("Response received: {:?}",
-                        response.text().await.unwrap()),
-                    Err(e) => debug!("Error on request: {:?}", e)
-            }
-        }
+            (format!("{}/{}/_doc/{}", cfg.endpoint_address, index, self.dbfile.id), event)
+        };
+
+        // Deliver the event, failed deliveries keep the event identity and
+        // are retried within the same batch, never dropped.
+        delivery::deliver(&cfg, &self.dbfile.id, request_url, data).await;
     }
 
     // ------------------------------------------------------------------------
