@@ -63,8 +63,37 @@ pub fn get_checksum(filename: String, read_limit: usize, algorithm: ShaType) -> 
                 let mut reader = BufReader::with_capacity(READ_CAPACITY, file);
 
                 if size > limit {
-                    info!("File size is above limit. Getting file '{}' header/partial checksum.", filename);
-                    get_partial_checksum(filename, algorithm)
+                    info!("File '{}' size is above the read limit ({} MB). Hashing the first {} bytes together with the file size.", filename, read_limit, limit);
+                    let mut remaining = limit;
+                    while remaining > 0 {
+                        let read = {
+                            match reader.fill_buf(){
+                                Ok(buffer) =>{
+                                    if buffer.is_empty() {
+                                        0
+                                    }else{
+                                        let take = std::cmp::min(buffer.len(), remaining);
+                                        hasher.update(&buffer[..take]);
+                                        take
+                                    }
+                                },
+                                Err(e) => {
+                                    debug!("Cannot read file. Checksum set to 'UNKNOWN', error: {}", e);
+                                    0
+                                }
+                            }
+                        };
+                        if read == 0 {
+                            break;
+                        }
+                        reader.consume(read);
+                        remaining -= read;
+                    }
+                    // Mix the full file size into the digest, so tail appends,
+                    // truncations and any other size change are detected on
+                    // the next scan even if the covered bytes did not change.
+                    hasher.update(&(size as u64).to_le_bytes());
+                    encode(hasher.finalize())
                 }else{
                     while length > 0 && data_read <= limit {
                         if iteration == 2 {
@@ -105,6 +134,7 @@ pub fn get_checksum(filename: String, read_limit: usize, algorithm: ShaType) -> 
 
 /// Produce partial checksum of file, it read the first MB of the file
 /// This method is targeted for big files where you cannot get checksum in a reasonable time.
+#[allow(dead_code)]
 pub fn get_partial_checksum(filename: String, algorithm: ShaType) -> String {
     let limit: usize = 1024 * 1024; // 1MB
     let mut hasher: Box<dyn DynDigest> = match algorithm {

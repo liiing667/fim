@@ -52,7 +52,8 @@ pub async fn check_path(cfg: AppConfig, root: String, first_scan: bool) {
                 Ok(dbfile) => {
                     let hash = dbfile.get_file_hash(cfg.clone());
                     let permissions = utils::get_unix_permissions(&dbfile.path);
-                    if dbfile.hash != hash {
+                    let size = metadata.len();
+                    if dbfile.hash != hash || dbfile.size != size {
                         debug!("The file '{}' checksum has changed.", path.display());
                         let current_dbfile = db.update_file(cfg.clone(), dbfile.clone());
                         match current_dbfile {

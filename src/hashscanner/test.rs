@@ -86,6 +86,61 @@ fn test_check_path() {
 #[test]
 #[serial]
 #[cfg(target_family = "unix")]
+/// Check that tail appends and truncations on files above the read limit are
+/// detected, updating the DB evidence, while retries keep the stored data.
+fn test_check_path_over_limit_tail_append() {
+    let cfg = AppConfig::new(&utils::get_os(),
+        Some("test/unit/config/linux/events_max_file_checksum_zero.yml"));
+    let tdb = DB::new(&cfg.hashscanner_file);
+    let scan_dir = String::from("./tmp/test_check_path_over_limit_tail_append");
+    let filepath = format!("{}/{}", scan_dir.clone(), "test_check_path_over_limit_tail_append.txt");
+    let _ = create_dir_all(scan_dir.clone());
+
+    let mut _file = match File::create(&filepath) {
+        Ok(file) => file,
+        Err(e) => panic!("Could not create test file, error: '{}'", e)
+    };
+    let _result = writeln!(_file, "{}", "Initial content.");
+
+    remove_db(&cfg.hashscanner_file);
+    tdb.create_table();
+    scan_path(cfg.clone(), scan_dir.clone());
+
+    // Appending data at the tail of the file must not keep the old match.
+    let _result = writeln!(_file, "{}", "Tail append.");
+    block_on(check_path(cfg.clone(), scan_dir.clone(), true));
+
+    let dbfile = tdb.get_file_by_path(filepath.clone()).unwrap();
+    assert_eq!(dbfile.path, filepath);
+    assert_eq!(dbfile.size, utils::get_file_size(&filepath));
+    assert_eq!(dbfile.hash, crate::hash::get_checksum(
+        filepath.clone(), 0, cfg.clone().hashscanner_algorithm));
+
+    // Truncating the file must not keep the old match either.
+    let file = File::options().write(true).open(&filepath).unwrap();
+    file.set_len(4).unwrap();
+    drop(file);
+    block_on(check_path(cfg.clone(), scan_dir.clone(), true));
+
+    let dbfile = tdb.get_file_by_path(filepath.clone()).unwrap();
+    assert_eq!(dbfile.size, utils::get_file_size(&filepath));
+    assert_eq!(dbfile.hash, crate::hash::get_checksum(
+        filepath.clone(), 0, cfg.clone().hashscanner_algorithm));
+
+    // A retry over an unmodified file must not produce any change.
+    let timestamp = dbfile.timestamp.clone();
+    block_on(check_path(cfg.clone(), scan_dir.clone(), true));
+    let dbfile = tdb.get_file_by_path(filepath.clone()).unwrap();
+    assert_eq!(dbfile.timestamp, timestamp);
+
+    let _ = remove_dir_all(scan_dir);
+}
+
+// ----------------------------------------------------------------------------
+
+#[test]
+#[serial]
+#[cfg(target_family = "unix")]
 #[should_panic(expected = "DBFileNotFoundError")]
 /// Check file deletion of filesystem and DB, it should panic with DBFileNotFoundError
 fn test_update_db() {

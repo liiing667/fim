@@ -128,10 +128,93 @@ fn test_get_checksum_dir() {
 fn test_get_checksum_over_limit() {
     let filename = String::from("test_get_checksum_over_limit");
     create_test_file(filename.clone());
+
+    // Retries over an unmodified file must produce the same checksum.
     let checksum = get_checksum(filename.clone(), 0, ShaType::Sha224);
-    let partial_checksum = get_partial_checksum(filename.clone(), ShaType::Sha224);
-    assert_eq!(partial_checksum, checksum);
+    assert_eq!(checksum, get_checksum(filename.clone(), 0, ShaType::Sha224));
+    // A partial checksum must not be reported as the full file checksum.
+    assert_ne!(checksum, get_checksum(filename.clone(), MAX_FILE_READ, ShaType::Sha224));
+
+    // Appending data at the tail of the file must not keep the old match.
+    let mut file = fs::OpenOptions::new().append(true).open(filename.clone()).unwrap();
+    file.write_all(b"tail append").unwrap();
+    drop(file);
+    let appended_checksum = get_checksum(filename.clone(), 0, ShaType::Sha224);
+    assert_ne!(checksum, appended_checksum);
+
+    // Truncating the file must not keep the old match either.
+    let file = fs::OpenOptions::new().write(true).open(filename.clone()).unwrap();
+    file.set_len(4).unwrap();
+    drop(file);
+    let truncated_checksum = get_checksum(filename.clone(), 0, ShaType::Sha224);
+    assert_ne!(checksum, truncated_checksum);
+    assert_ne!(appended_checksum, truncated_checksum);
+
     remove_test_file(filename.clone());
+}
+
+// ------------------------------------------------------------------------
+
+#[test]
+fn test_get_checksum_over_limit_tail_append() {
+    let filename = String::from("test_get_checksum_over_limit_tail_append");
+    let read_limit = 1; // 1MB
+    let mut file = File::create(filename.clone()).unwrap();
+    file.write_all(vec![0u8; 1024 * 1024 + 1].as_slice()).unwrap();
+    drop(file);
+
+    // Retries over an unmodified big file must produce the same checksum.
+    let checksum = get_checksum(filename.clone(), read_limit, ShaType::Sha256);
+    assert_eq!(checksum, get_checksum(filename.clone(), read_limit, ShaType::Sha256));
+
+    // Appending 256 bytes at the tail must not keep the old match, even if
+    // the covered bytes are exactly the same.
+    let mut file = fs::OpenOptions::new().append(true).open(filename.clone()).unwrap();
+    file.write_all(vec![1u8; 256].as_slice()).unwrap();
+    drop(file);
+    let appended_checksum = get_checksum(filename.clone(), read_limit, ShaType::Sha256);
+    assert_ne!(checksum, appended_checksum);
+
+    // Truncating the file must not keep the old match either.
+    let file = fs::OpenOptions::new().write(true).open(filename.clone()).unwrap();
+    file.set_len(1024 * 1024).unwrap();
+    drop(file);
+    let truncated_checksum = get_checksum(filename.clone(), read_limit, ShaType::Sha256);
+    assert_ne!(checksum, truncated_checksum);
+    assert_ne!(appended_checksum, truncated_checksum);
+
+    remove_test_file(filename.clone());
+}
+
+// ------------------------------------------------------------------------
+
+#[test]
+fn test_get_checksum_over_limit_coverage() {
+    // Both files share the same first 1MB and size, they only differ past the
+    // read limit, so an over limit checksum must cover exactly the read limit.
+    let filename = String::from("test_get_checksum_over_limit_coverage");
+    let filename2 = String::from("test_get_checksum_over_limit_coverage2");
+    let read_limit = 1; // 1MB
+
+    let mut data = vec![0u8; 1024 * 1024 + 1];
+    let mut file = File::create(filename.clone()).unwrap();
+    file.write_all(data.as_slice()).unwrap();
+    drop(file);
+
+    data[1024 * 1024] = 1;
+    let mut file2 = File::create(filename2.clone()).unwrap();
+    file2.write_all(data.as_slice()).unwrap();
+    drop(file2);
+
+    // Differences past the read limit are out of the covered range.
+    assert_eq!(get_checksum(filename.clone(), read_limit, ShaType::Sha256),
+        get_checksum(filename2.clone(), read_limit, ShaType::Sha256));
+    // While a full read of both files must detect the difference.
+    assert_ne!(get_checksum(filename.clone(), MAX_FILE_READ, ShaType::Sha256),
+        get_checksum(filename2.clone(), MAX_FILE_READ, ShaType::Sha256));
+
+    remove_test_file(filename.clone());
+    remove_test_file(filename2.clone());
 }
 
 // ------------------------------------------------------------------------
