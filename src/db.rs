@@ -6,6 +6,7 @@ use crate::appconfig::AppConfig;
 use rusqlite::{Connection, Error, params};
 use rusqlite::Error::QueryReturnedNoRows;
 use log::*;
+use std::path::{Component, Path, PathBuf};
 
 #[derive(Clone)]
 pub struct DB {
@@ -14,6 +15,93 @@ pub struct DB {
 
 #[cfg(test)]
 mod test;
+
+// ----------------------------------------------------------------------------
+
+/// Escape the characters SQLite interprets specially inside a LIKE pattern.
+fn escape_like(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '\\' | '%' | '_' => {
+                escaped.push('\\');
+                escaped.push(character);
+            },
+            _ => escaped.push(character)
+        }
+    }
+    escaped
+}
+
+// ----------------------------------------------------------------------------
+
+/// Lexically normalize a path without accessing the filesystem.
+/// This removes `.` components and resolves `..` components when possible,
+/// keeping relative paths relative and preserving leading `..` components.
+fn normalize_path(path: &str) -> String {
+    let mut normalized = PathBuf::new();
+
+    for component in Path::new(path).components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => (),
+            Component::ParentDir => {
+                let can_pop = matches!(
+                    normalized.components().next_back(),
+                    Some(Component::Normal(_))
+                );
+                if can_pop {
+                    normalized.pop();
+                } else {
+                    let at_root = matches!(
+                        normalized.components().next_back(),
+                        Some(Component::RootDir) | Some(Component::Prefix(_))
+                    );
+                    if !at_root {
+                        normalized.push(component.as_os_str());
+                    }
+                }
+            },
+            Component::Normal(part) => normalized.push(part)
+        }
+    }
+
+    if normalized.as_os_str().is_empty() {
+        String::from(".")
+    } else {
+        normalized.to_string_lossy().into_owned()
+    }
+}
+
+// ----------------------------------------------------------------------------
+
+/// Check whether `candidate` belongs to the directory tree rooted at `root`.
+/// Both paths are compared after lexical normalization so that `.`, `..` and
+/// equivalent relative fragments refer to the same root.
+fn path_is_within_root(root: &str, candidate: &str) -> bool {
+    let normalized_root = normalize_path(root);
+    let normalized_candidate = normalize_path(candidate);
+
+    if normalized_root == normalized_candidate {
+        return true;
+    }
+
+    // "." represents the current directory, so every relative path that does
+    // not climb out of it belongs to that root.
+    if normalized_root == "." {
+        let parent_prefix = format!("..{}", std::path::MAIN_SEPARATOR);
+        return normalized_candidate != ".."
+            && !normalized_candidate.starts_with(&parent_prefix)
+            && !Path::new(&normalized_candidate).is_absolute();
+    }
+
+    let mut root_prefix = normalized_root;
+    if !root_prefix.ends_with(std::path::MAIN_SEPARATOR) {
+        root_prefix.push(std::path::MAIN_SEPARATOR);
+    }
+    normalized_candidate.starts_with(&root_prefix)
+}
 
 // ----------------------------------------------------------------------------
 
@@ -152,26 +240,57 @@ impl DB {
     pub fn get_file_list(&self, path: String) -> Vec<DBFile> {
         let connection = self.open();
         let mut list = Vec::new();
-        let query = format!("SELECT * FROM files WHERE path LIKE '{}%'", path);
-        let mut statement = connection.prepare_cached(&query).unwrap();
-        let result = statement.query_map([], |row| {
-            Ok(DBFile {
-                id: row.get(0).unwrap(),
-                timestamp: row.get(1).unwrap(),
-                hash: row.get(2).unwrap(),
-                path: row.get(3).unwrap(),
-                size: row.get(4).unwrap(),
-                permissions: row.get(5).unwrap()
-            })
-        });
-        match result {
-            Ok(mapped_rows) => {
-                for file in mapped_rows {
-                    list.push(file.unwrap())
-                }
-            },
-            Err(e) => error!("Could not get database file list, error: {:?}", e)
+
+        // An empty request has no root to match. Do not let it turn into the
+        // LIKE '%%' pattern that matches the entire database.
+        if path.is_empty() {
+            self.close(connection);
+            return list;
+        }
+
+        // Use the final component as a parameterized, escaped pre-filter. The
+        // exact root check is done below on normalized paths, which keeps
+        // sibling directories and LIKE metacharacters out of the result.
+        let normalized_path = normalize_path(&path);
+        let pattern = match Path::new(&normalized_path)
+            .file_name().and_then(|name| name.to_str()) {
+            Some(name) => format!("%{}%", escape_like(name)),
+            None => String::from("%")
         };
+
+        let prepared = connection.prepare_cached(
+            "SELECT * FROM files WHERE path LIKE ?1 ESCAPE '\\'");
+        match prepared {
+            Ok(mut statement) => {
+                match statement.query_map([pattern], |row| {
+                    Ok(DBFile {
+                        id: row.get(0)?,
+                        timestamp: row.get(1)?,
+                        hash: row.get(2)?,
+                        path: row.get(3)?,
+                        size: row.get(4)?,
+                        permissions: row.get(5)?
+                    })
+                }) {
+                    Ok(mapped_rows) => {
+                        for file in mapped_rows {
+                            match file {
+                                Ok(file) => {
+                                    if path_is_within_root(&path, &file.path) {
+                                        list.push(file);
+                                    }
+                                },
+                                Err(e) => error!("Could not read database file list row, error: {:?}", e)
+                            }
+                        }
+                    },
+                    Err(e) => error!("Could not get database file list, error: {:?}", e)
+                };
+            },
+            Err(e) => error!("Could not prepare database file list query, error: {:?}", e)
+        }
+
+        self.close(connection);
         list
     }
 

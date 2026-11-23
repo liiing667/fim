@@ -32,6 +32,36 @@ fn get_dbfile() -> DBFile {
 
 // ----------------------------------------------------------------------------
 
+fn get_dbfile_with_path(id: &str, path: &str) -> DBFile {
+    DBFile {
+        id: String::from(id),
+        timestamp: String::from("TIMESTAMP"),
+        hash: String::from("HASH"),
+        path: String::from(path),
+        size: 10,
+        permissions: 0
+    }
+}
+
+// ----------------------------------------------------------------------------
+
+#[test]
+/// Paths are normalized lexically before comparing roots.
+fn test_path_normalization() {
+    assert_eq!(normalize_path("./a/./b/../c"), "a/c");
+    assert_eq!(normalize_path("/a/b/../../.."), "/");
+    assert_eq!(normalize_path("../a/../b"), "../b");
+
+    assert!(path_is_within_root("/a/b", "/a/b/c"));
+    assert!(path_is_within_root("/a/b", "/a/b/../b/c"));
+    assert!(!path_is_within_root("/a/b", "/a/bc/c"));
+    assert!(path_is_within_root(".", "a/b"));
+    assert!(!path_is_within_root(".", "../a/b"));
+    assert!(!path_is_within_root(".", "/a/b"));
+}
+
+// ----------------------------------------------------------------------------
+
 #[test]
 #[serial]
 /// Check new instance creation, the instance should match the expected DB path.
@@ -215,6 +245,73 @@ fn test_get_file_list() {
     assert_eq!(list[1].path, dbfile1.path);
     assert_eq!(list[1].size, dbfile1.size);
     assert_eq!(list[1].permissions, dbfile1.permissions);
+}
+
+// ------------------------------------------------------------------------
+
+#[test]
+#[serial]
+/// File list queries must stay inside the requested root, even when the path
+/// contains LIKE metacharacters, quotes, sibling prefixes or relative fragments.
+fn test_get_file_list_escapes_request_path() {
+    let db_path = "fim.db";
+    let tdb = DB::new(db_path);
+    let files = [
+        ("PERCENT0", "ROOT%LITERAL/file.txt"),
+        ("PERCENT1", "ROOT%LITERAL/nested/file.txt"),
+        ("PERCENT2", "ROOTX_LITERAL/file.txt"),
+        ("UNDER0", "UNDER_SCORE/file.txt"),
+        ("UNDER1", "UNDERXSCORE/file.txt"),
+        ("QUOTE0", "QUOTE'ROOT/file.txt"),
+        ("QUOTE1", "QUOTE/ROOT/file.txt"),
+        ("SIBLING0", "SIBLING/file.txt"),
+        ("SIBLING1", "SIBLING_EXTRA/file.txt"),
+        ("RELATIVE0", "REL/../REL/file.txt"),
+        ("RELATIVE1", "./REL2/file.txt"),
+        ("OTHER0", "OTHER/file.txt")
+    ];
+
+    remove_db(db_path);
+    tdb.create_table();
+    for (id, path) in files {
+        tdb.insert_file(get_dbfile_with_path(id, path));
+    }
+
+    let percent = tdb.get_file_list(String::from("ROOT%LITERAL"));
+    assert_eq!(percent.len(), 2);
+    assert!(percent.iter().all(|file| file.path.starts_with("ROOT%LITERAL/")));
+
+    let underscore = tdb.get_file_list(String::from("UNDER_SCORE"));
+    assert_eq!(underscore.len(), 1);
+    assert_eq!(underscore[0].path, "UNDER_SCORE/file.txt");
+
+    let quote = tdb.get_file_list(String::from("QUOTE'ROOT"));
+    assert_eq!(quote.len(), 1);
+    assert_eq!(quote[0].path, "QUOTE'ROOT/file.txt");
+
+    let sibling = tdb.get_file_list(String::from("SIBLING"));
+    assert_eq!(sibling.len(), 1);
+    assert_eq!(sibling[0].path, "SIBLING/file.txt");
+
+    let relative = tdb.get_file_list(String::from("REL"));
+    assert_eq!(relative.len(), 1);
+    assert_eq!(relative[0].path, "REL/../REL/file.txt");
+
+    let relative_dot = tdb.get_file_list(String::from("REL2"));
+    assert_eq!(relative_dot.len(), 1);
+    assert_eq!(relative_dot[0].path, "./REL2/file.txt");
+
+    let missing = tdb.get_file_list(String::from("DOES_NOT_EXIST"));
+    assert!(missing.is_empty());
+
+    let empty_request = tdb.get_file_list(String::new());
+    assert!(empty_request.is_empty());
+
+    // A malformed request must not poison the next query.
+    let malformed = tdb.get_file_list(String::from("QUOTE'ROOT' OR '1'='1"));
+    assert!(malformed.is_empty());
+    let after_malformed = tdb.get_file_list(String::from("ROOT%LITERAL"));
+    assert_eq!(after_malformed.len(), 2);
 }
 
 // ------------------------------------------------------------------------
