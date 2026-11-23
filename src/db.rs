@@ -179,21 +179,32 @@ impl DB {
 
     /// Update db information of the given DBFile information
     pub fn update_file(&self, cfg: AppConfig, dbfile: DBFile) -> Option<DBFile>{
+        match DBFile::try_new(cfg, &dbfile.path, Some(dbfile.id.clone())) {
+            Some(current_dbfile) => self.update_file_snapshot(current_dbfile),
+            None => None
+        }
+    }
+
+    // ------------------------------------------------------------------------
+
+    /// Update db information using an already captured, consistent DBFile
+    /// snapshot. This avoids hashing the file a second time and storing a
+    /// different snapshot than the one used to detect the change.
+    pub fn update_file_snapshot(&self, dbfile: DBFile) -> Option<DBFile>{
         let connection = self.open();
-        let current_dbfile = DBFile::new(cfg, &dbfile.path, Some(dbfile.id));
         let query = "UPDATE files SET timestamp = ?1, hash = ?2, size = ?3, permissions = ?4 WHERE id = ?5";
 
         let mut statement = connection.prepare(query).unwrap();
         let result = statement.execute(params![
-            current_dbfile.timestamp,
-            current_dbfile.hash,
-            current_dbfile.size,
-            current_dbfile.permissions,
-            current_dbfile.id]);
+            dbfile.timestamp,
+            dbfile.hash,
+            dbfile.size,
+            dbfile.permissions,
+            dbfile.id]);
         match result {
             Ok(_v) => {
                 debug!("File '{}', updated with new information.", dbfile.path);
-                Some(current_dbfile)
+                Some(dbfile)
             },
             Err(e) => {
                 error!("Cannot update file '{}' information, Error: {:?}", dbfile.path, e);

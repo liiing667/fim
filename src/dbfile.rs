@@ -5,7 +5,7 @@ use crate::hash;
 use crate::appconfig::*;
 
 use std::fmt;
-use std::path::Path;
+use log::*;
 
 pub struct DBFileError {
     kind: String,
@@ -96,27 +96,74 @@ impl fmt::Display for DBFile {
 
 impl DBFile {
     pub fn new(cfg: AppConfig, path: &str, id: Option<String>) -> Self {
-        let metadata = Path::new(path).metadata().unwrap();
-        let permissions = utils::get_unix_permissions(path);
-        let size = metadata.clone().len();
-        let hash = hash::get_checksum(
-            String::from(path), 
-            cfg.clone().events_max_file_checksum,
-            cfg.clone().hashscanner_algorithm);
+        match Self::try_new(cfg, path, id.clone()) {
+            Some(dbfile) => dbfile,
+            None => {
+                warn!(
+                    "Could not obtain a stable snapshot of '{}', storing UNKNOWN metadata.",
+                    path
+                );
+                DBFile {
+                    id: match id {
+                        Some(data) => data,
+                        None => utils::get_uuid()
+                    },
+                    timestamp: utils::get_current_time_millis(),
+                    hash: String::from("UNKNOWN"),
+                    path: String::from(path),
+                    size: 0,
+                    permissions: 0
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------------
+
+    /// Build a DBFile only when the complete hash, size and permissions could
+    /// be read from one stable file snapshot. Returns None if the file cannot
+    /// be read consistently.
+    pub fn try_new(cfg: AppConfig, path: &str, id: Option<String>) -> Option<Self> {
+        Self::try_new_with_snapshot(cfg, path, id).map(|(dbfile, _snapshot)| dbfile)
+    }
+
+    // ------------------------------------------------------------------------
+
+    /// Build a DBFile and return the snapshot it came from, so callers can
+    /// verify the path still matches after writing it to the database.
+    pub fn try_new_with_snapshot(
+        cfg: AppConfig,
+        path: &str,
+        id: Option<String>
+    ) -> Option<(Self, hash::FileSnapshot)> {
+        let snapshot = match hash::get_file_snapshot(
+            path,
+            cfg.events_max_file_checksum,
+            cfg.hashscanner_algorithm
+        ) {
+            Ok(snapshot) => snapshot,
+            Err(e) => {
+                warn!("Cannot get a consistent snapshot of '{}', error: {}", path, e);
+                return None;
+            }
+        };
 
         let target_id = match id {
             Some(data) => data,
             None => utils::get_uuid()
         };
 
-        DBFile {
-            id: target_id,
-            timestamp: utils::get_current_time_millis(),
-            hash,
-            path: String::from(path),
-            size,
-            permissions
-        }
+        Some((
+            DBFile {
+                id: target_id,
+                timestamp: utils::get_current_time_millis(),
+                hash: snapshot.hash.clone(),
+                path: String::from(path),
+                size: snapshot.size,
+                permissions: snapshot.permissions
+            },
+            snapshot
+        ))
     }
 
     // ------------------------------------------------------------------------
@@ -135,10 +182,16 @@ impl DBFile {
     // ------------------------------------------------------------------------
 
     pub fn get_file_hash(&self, cfg: AppConfig) -> String {
-        hash::get_checksum(
-            String::from(&self.path),
-            cfg.clone().events_max_file_checksum,
-            cfg.clone().hashscanner_algorithm
-        )
+        match hash::get_file_snapshot(
+            &self.path,
+            cfg.events_max_file_checksum,
+            cfg.hashscanner_algorithm
+        ) {
+            Ok(snapshot) => snapshot.hash,
+            Err(e) => {
+                debug!("Cannot get checksum of '{}', error: {}", self.path, e);
+                String::from("UNKNOWN")
+            }
+        }
     }
 }

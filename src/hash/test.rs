@@ -4,6 +4,9 @@ use super::*;
 use std::fs;
 use std::fs::File;
 use std::io::prelude::*;
+use std::thread;
+use std::time::Duration;
+use serial_test::serial;
 
 // ------------------------------------------------------------------------
 
@@ -13,6 +16,20 @@ fn create_test_file(filename: String) {
 
 fn remove_test_file(filename: String) {
     fs::remove_file(filename).unwrap()
+}
+
+fn create_large_file(filename: &str, size: usize, byte: u8) {
+    let mut file = File::create(filename).unwrap();
+    let chunk = vec![byte; 1024 * 1024];
+    let full_chunks = size / chunk.len();
+    for _ in 0..full_chunks {
+        file.write_all(&chunk).unwrap();
+    }
+    let remaining = size % chunk.len();
+    if remaining > 0 {
+        file.write_all(&chunk[..remaining]).unwrap();
+    }
+    file.flush().unwrap();
 }
 
 // ------------------------------------------------------------------------
@@ -142,6 +159,85 @@ fn test_get_checksum_bad() {
     create_test_file(filename.clone());
     assert_ne!(get_checksum(filename.clone(), MAX_FILE_READ, ShaType::Sha512), String::from("This is a test"));
     remove_test_file(filename.clone());
+}
+
+// ------------------------------------------------------------------------
+
+#[test]
+#[serial]
+#[cfg(target_family = "unix")]
+/// A path replacement while a large file is being hashed must not mix the old
+/// size with the new checksum. The retry has to land on the new snapshot.
+fn test_get_file_snapshot_atomic_replacement() {
+    let filename = String::from("test_get_file_snapshot_atomic_replacement");
+    let replacement = String::from("test_get_file_snapshot_atomic_replacement.new");
+    create_large_file(&filename, 16 * 1024 * 1024, b'A');
+    create_large_file(&replacement, 4 * 1024 * 1024, b'B');
+
+    let target = filename.clone();
+    let source = replacement.clone();
+    let handle = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(5));
+        fs::rename(&source, &target).unwrap();
+    });
+
+    let snapshot = get_file_snapshot(&filename, MAX_FILE_READ, ShaType::Sha256).unwrap();
+    handle.join().unwrap();
+
+    let final_snapshot = get_file_snapshot(&filename, MAX_FILE_READ, ShaType::Sha256).unwrap();
+    assert_eq!(snapshot.size, final_snapshot.size);
+    assert_eq!(snapshot.hash, final_snapshot.hash);
+    assert_eq!(snapshot.size, 4 * 1024 * 1024);
+
+    remove_test_file(filename);
+}
+
+// ------------------------------------------------------------------------
+
+#[test]
+#[serial]
+#[cfg(target_family = "unix")]
+/// Truncating a file while it is being hashed must discard the mixed
+/// observation and retry using the truncated file.
+fn test_get_file_snapshot_truncate_during_read() {
+    let filename = String::from("test_get_file_snapshot_truncate_during_read");
+    create_large_file(&filename, 16 * 1024 * 1024, b'A');
+
+    let target = filename.clone();
+    let handle = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(5));
+        let file = fs::OpenOptions::new().write(true).open(&target).unwrap();
+        file.set_len(1024 * 1024).unwrap();
+    });
+
+    let snapshot = get_file_snapshot(&filename, MAX_FILE_READ, ShaType::Sha256).unwrap();
+    handle.join().unwrap();
+
+    let final_snapshot = get_file_snapshot(&filename, MAX_FILE_READ, ShaType::Sha256).unwrap();
+    assert_eq!(snapshot.size, final_snapshot.size);
+    assert_eq!(snapshot.hash, final_snapshot.hash);
+    assert_eq!(snapshot.size, 1024 * 1024);
+
+    remove_test_file(filename);
+}
+
+// ------------------------------------------------------------------------
+
+#[test]
+/// A partial (large file) snapshot must keep the size and the header checksum
+/// from the same opened file.
+fn test_get_file_snapshot_partial_checksum() {
+    let filename = String::from("test_get_file_snapshot_partial_checksum");
+    create_large_file(&filename, 2 * 1024 * 1024, b'A');
+
+    let snapshot = get_file_snapshot(&filename, 1, ShaType::Sha256).unwrap();
+    assert_eq!(snapshot.size, 2 * 1024 * 1024);
+    assert_eq!(
+        snapshot.hash,
+        get_partial_checksum(filename.clone(), ShaType::Sha256)
+    );
+
+    remove_test_file(filename);
 }
 
 // ------------------------------------------------------------------------
