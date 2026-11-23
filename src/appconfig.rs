@@ -404,14 +404,26 @@ impl AppConfig {
     // ------------------------------------------------------------------------
 
     pub fn get_index(&self, raw_path: &str, cwd: &str, array: Array) -> usize {
-        // Iterate over monitoring paths to match ignore string and ignore event or not
-        match array.iter().position(|it| {
-            if !cwd.is_empty() && (raw_path.starts_with("./") || raw_path == "." || !raw_path.contains('/')) {
-                utils::match_path(cwd, it["path"].as_str().unwrap())
-            }else{
-                utils::match_path(raw_path, it["path"].as_str().unwrap())
+        let event_path = utils::resolve_path(raw_path, cwd);
+
+        // Prefer a lexical match when neither side contains a symbolic link.
+        // This keeps the order of historical rules (for example '/bin' and
+        // '/usr/bin' when one is a link to the other) stable.
+        if utils::is_lexically_stable(event_path.as_str()) {
+            if let Some(pos) = array.iter().position(|it| {
+                let rule_path = it["path"].as_str().unwrap();
+                utils::is_lexically_stable(rule_path) &&
+                    utils::match_path_lexical(event_path.as_str(), rule_path)
+            }) {
+                return pos;
             }
-        }){
+        }
+
+        // Fall back to the canonical namespace so events and rules still agree
+        // when they reach the same root through different symbolic links.
+        match array.iter().position(|it| {
+            utils::match_path(event_path.as_str(), it["path"].as_str().unwrap())
+        }) {
             Some(pos) => pos,
             None => usize::MAX
         }
@@ -420,6 +432,9 @@ impl AppConfig {
     // ------------------------------------------------------------------------
 
     pub fn get_labels(&self, index: usize, array: Array) -> Vec<String> {
+        if index == usize::MAX || index >= array.len() {
+            return Vec::new();
+        }
         array[index]["labels"].clone().into_vec().unwrap_or_default()
         .to_vec().iter().map(|element| String::from(element.as_str().unwrap()) ).collect()
     }
@@ -436,8 +451,20 @@ impl AppConfig {
     // ------------------------------------------------------------------------
 
     pub fn match_exclude(&self, index: usize, path: &str, array: Array) -> bool {
+        self.match_exclude_in(index, path, "", array)
+    }
+
+    // ------------------------------------------------------------------------
+
+    pub fn match_exclude_in(&self, index: usize, path: &str, cwd: &str, array: Array) -> bool {
+        let event_path = utils::resolve_path(path, cwd);
+        let root_path = array[index]["path"].as_str().unwrap_or("");
+
         match array[index]["exclude"].as_vec() {
-            Some(igv) => igv.to_vec().iter().any(|exclude| path.contains(exclude.as_str().unwrap()) ),
+            Some(igv) => igv.to_vec().iter().any(|exclude| {
+                let exclude_path = utils::resolve_path(exclude.as_str().unwrap(), root_path);
+                utils::match_path(event_path.as_str(), exclude_path.as_str())
+            }),
             None => false
         }
     }
@@ -455,13 +482,9 @@ impl AppConfig {
 
     // Returns if a given path and filename is in the configuration paths
     pub fn path_in(&self, raw_path: &str, cwd: &str, vector: Vec<Yaml>) -> bool {
-        // Iterate over monitoring paths to match ignore string and ignore event or not
+        let event_path = utils::resolve_path(raw_path, cwd);
         vector.iter().any(|it| {
-            if raw_path.starts_with("./") || raw_path == "." || !raw_path.contains('/') {
-                utils::match_path(cwd, it["path"].as_str().unwrap())
-            }else{
-                utils::match_path(raw_path, it["path"].as_str().unwrap())
-            }
+            utils::match_path(event_path.as_str(), it["path"].as_str().unwrap())
         })
     }
 

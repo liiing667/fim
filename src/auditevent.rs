@@ -433,7 +433,13 @@ pub fn get_parent(paths: Vec<HashMap<String, String>>, cwd: &str, cfg: AppConfig
         cfg.path_in(p["name"].as_str(), cwd, cfg.audit.clone())
     }){
         Some(p) => p.clone(),
-        None => get_item_path(paths.clone(), cwd, cfg.clone())
+        None => match paths.iter().find(|p|{
+            utils::get_field((*p).clone(), "nametype") != "UNKNOWN" &&
+            cfg.path_in(p["name"].as_str(), cwd, cfg.audit.clone())
+        }) {
+            Some(p) => p.clone(),
+            None => paths.first().cloned().unwrap_or_default()
+        }
     }
 }
 
@@ -446,7 +452,13 @@ pub fn get_item_path(paths: Vec<HashMap<String, String>>, cwd: &str, cfg: AppCon
         cfg.path_in(p["name"].as_str(), cwd, cfg.audit.clone())
     }){
         Some(p) => p.clone(),
-        None => get_parent(paths.clone(), cwd, cfg.clone())
+        None => match paths.iter().find(|p|{
+            utils::get_field((*p).clone(), "nametype") == "PARENT" &&
+            cfg.path_in(p["name"].as_str(), cwd, cfg.audit.clone())
+        }) {
+            Some(p) => p.clone(),
+            None => paths.first().cloned().unwrap_or_default()
+        }
     }
 }
 

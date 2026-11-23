@@ -12,7 +12,7 @@ use std::io::{Read, SeekFrom};
 use std::io::prelude::*;
 use crate::appconfig;
 // To manage paths
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 // To run commands
 use std::process::Command;
 // To log the program process
@@ -95,7 +95,139 @@ pub fn get_filename_path(path: &str) -> String {
 
 // Function to clean trailing slash of a path
 pub fn clean_path(path: &str) -> String {
-    String::from(if path.ends_with('/') || path.ends_with('\\'){ pop(path) }else{ path })
+    let mut clean = path;
+    while clean.ends_with('/') || clean.ends_with('\\') {
+        clean = pop(clean);
+    }
+    String::from(clean)
+}
+
+// ----------------------------------------------------------------------------
+
+// Resolve a path against a base directory. Absolute paths are kept as they are,
+// relative paths are joined to the provided working directory. An empty
+// working directory means the process current directory.
+pub fn resolve_path(path: &str, cwd: &str) -> String {
+    let raw_path = Path::new(path);
+    if raw_path.is_absolute() {
+        return String::from(path);
+    }
+
+    let base = if cwd.is_empty() { get_current_dir() } else { String::from(cwd) };
+    Path::new(&base).join(raw_path).to_string_lossy().into_owned()
+}
+
+// ----------------------------------------------------------------------------
+
+// Convert a path to an absolute one without resolving symbolic links.
+fn absolute_path(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        Path::new(&get_current_dir()).join(path)
+    }
+}
+
+// ----------------------------------------------------------------------------
+
+// Remove '.', '..' and duplicated separators from an absolute path.
+fn normalize_components(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {},
+            Component::ParentDir => {
+                if normalized.file_name().is_some() {
+                    normalized.pop();
+                }else if ! normalized.has_root() {
+                    normalized.push("..");
+                }
+            },
+            Component::Normal(name) => normalized.push(name)
+        }
+    }
+    normalized
+}
+
+// ----------------------------------------------------------------------------
+
+// Resolve symbolic links on every component that exists in the filesystem.
+// Components that do not exist yet are kept literally, so paths to files that
+// are being created or removed can still be matched against their parent.
+fn resolve_symlinks(path: &Path) -> PathBuf {
+    let absolute = absolute_path(path);
+    let mut resolved = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::Prefix(prefix) => resolved.push(prefix.as_os_str()),
+            Component::RootDir => resolved.push(component.as_os_str()),
+            Component::CurDir => {},
+            Component::ParentDir => {
+                if resolved.file_name().is_some() {
+                    resolved.pop();
+                }
+            },
+            Component::Normal(name) => {
+                let mut candidate = resolved.clone();
+                candidate.push(name);
+                match candidate.canonicalize() {
+                    Ok(canonical) => resolved = canonical,
+                    Err(_) => resolved.push(name)
+                }
+            }
+        }
+    }
+    resolved
+}
+
+// ----------------------------------------------------------------------------
+
+// Lexically normalized absolute representation of a path.
+pub fn lexical_path(path: &str) -> PathBuf {
+    normalize_components(&absolute_path(Path::new(path)))
+}
+
+// ----------------------------------------------------------------------------
+
+// Canonical absolute representation of a path, resolving symbolic links when
+// possible and falling back to the lexical representation for missing paths.
+pub fn canonical_path(path: &str) -> PathBuf {
+    resolve_symlinks(Path::new(path))
+}
+
+// ----------------------------------------------------------------------------
+
+// Check whether the symlink-aware and the lexical representations agree. When
+// they don't, matching must use the canonical representation to avoid paths
+// escaping from a monitored root through a symbolic link.
+pub fn is_lexically_stable(path: &str) -> bool {
+    lexical_path(path) == canonical_path(path)
+}
+
+// ----------------------------------------------------------------------------
+
+// Keep the previous behaviour of comparing a file with the directory that
+// contains it. Missing files are assumed to be directories/prefixes.
+fn match_path_dir(path: PathBuf) -> PathBuf {
+    if let Ok(md) = metadata(&path) {
+        if md.is_file() {
+            if let Some(parent) = path.parent() {
+                return parent.to_path_buf();
+            }
+        }
+    }
+    path
+}
+
+// ----------------------------------------------------------------------------
+
+// Component-wise prefix match without resolving symbolic links.
+pub fn match_path_lexical(raw_path: &str, compare_path: &str) -> bool {
+    let raw_tokens = match_path_dir(lexical_path(raw_path));
+    let compare_tokens = match_path_dir(lexical_path(compare_path));
+    raw_tokens.starts_with(&compare_tokens)
 }
 
 // ----------------------------------------------------------------------------
@@ -152,51 +284,14 @@ pub fn check_auditd() -> bool {
 
 // ------------------------------------------------------------------------
 
-// Returns if raw_path contains compare_path
+// Returns if raw_path is inside compare_path. Both paths are normalized to a
+// common root, resolving '.', '..', trailing separators and symbolic links so
+// the event and the configured (include/exclude) path are compared in the same
+// namespace.
 pub fn match_path(raw_path: &str, compare_path: &str) -> bool {
-    let max_pops = 128;
-    let mut pops = 0;
-    let pattern = if get_os() == "windows" { "\\" } else { "/" };
-    let compare_path_clean = &clean_path(compare_path);
-    let raw_path_clean = &clean_path(raw_path);
-
-    let mut raw_tokens: Vec<&str>;
-    let mut compare_tokens: Vec<&str>;
-
-    match metadata(raw_path_clean) {
-        Ok(md) => if md.is_file(){
-            raw_tokens = raw_path_clean.split(pattern).collect();
-            raw_tokens.pop();
-        }else{
-            raw_tokens = raw_path_clean.split(pattern).collect();
-        }
-        ,
-        Err(e) => { 
-            debug!("Cannot fetch metadata information of '{}', assuming not a file. Error: {}", raw_path_clean, e);
-            raw_tokens = raw_path_clean.split(pattern).collect();
-        }
-    };
-    match metadata(compare_path_clean) {
-        Ok(md) => if md.is_file(){
-            compare_tokens = compare_path_clean.split(pattern).collect();
-            compare_tokens.pop();
-        }else{
-            compare_tokens = compare_path_clean.split(pattern).collect();
-        },
-        Err(e) => {
-            debug!("Cannot fetch metadata information of '{}', assuming not a file. Error: {}", compare_path_clean, e);
-            compare_tokens = compare_path_clean.split(pattern).collect();
-        }
-    };
-
-    while raw_tokens.len() > compare_tokens.len() && pops < max_pops {
-        raw_tokens.pop();
-        pops += 1;
-    }
-    
-    raw_tokens.iter().zip(compare_tokens.iter()).all(|(r,c)| {
-        clean_path(r) == clean_path(c)
-    })
+    let raw_tokens = match_path_dir(canonical_path(raw_path));
+    let compare_tokens = match_path_dir(canonical_path(compare_path));
+    raw_tokens.starts_with(&compare_tokens)
 }
 
 // ----------------------------------------------------------------------------

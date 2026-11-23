@@ -240,15 +240,24 @@ pub async fn monitor(
 
                         for audit_event in events {
                             if ! audit_event.is_empty() {
+                                // Audit paths are relative to the cwd reported
+                                // in the same audit record. Resolve it before
+                                // checking ownership or exclusions so both
+                                // checks use the same root.
+                                let audit_path = utils::resolve_path(
+                                    audit_event.path.as_str(),
+                                    audit_event.cwd.as_str());
+
                                 // Getting the position of event in config (match ignore and labels)
-                                let index = cfg.get_index(audit_event.clone().path.as_str(),
-                                    audit_event.clone().cwd.as_str(),
+                                let index = cfg.get_index(audit_path.as_str(),
+                                    "",
                                     cfg.clone().audit.to_vec());
 
                                 if index != usize::MAX {
                                     // If event contains ignored string ignore event
                                     if ! cfg.match_ignore(index, audit_event.clone().file.as_str(), cfg.clone().audit)  &&
-                                        ! cfg.match_exclude(index, audit_event.clone().path.as_str(), cfg.clone().audit) &&
+                                        ! cfg.match_exclude_in(index, audit_event.path.as_str(),
+                                            audit_event.cwd.as_str(), cfg.clone().audit) &&
                                         cfg.match_allowed(index, audit_event.clone().file.as_str(), cfg.clone().audit) {
                                         audit_event.process(destination.clone().as_str(), index_name.clone(), cfg.clone(), ruleset.clone()).await;
                                     }else{
@@ -261,11 +270,11 @@ pub async fn monitor(
                             debug!("Event processed: {:?}", audit_event.clone());
                         }
                     }else {
-                        let index = cfg.get_index(event_path.to_str().unwrap(), "", cfg.clone().monitor.to_vec());
                         let parent = match event_path.is_dir() {
                             true => event_path.to_str().unwrap(),
                             false => event_path.parent().unwrap().to_str().unwrap()
                         };
+                        let index = cfg.get_index(parent, "", cfg.clone().monitor.to_vec());
                         if index != usize::MAX {
                             let labels = cfg.get_labels(index, cfg.clone().monitor);
                             if ! cfg.match_ignore(index, event_filename.to_str().unwrap(), cfg.clone().monitor) &&
