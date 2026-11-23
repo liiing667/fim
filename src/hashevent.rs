@@ -52,53 +52,56 @@ impl HashEvent {
 
     // ------------------------------------------------------------------------
 
-    async fn send(&self, cfg: AppConfig) {
-        use time::OffsetDateTime;
-
+    // The target endpoint, its credentials and the batch identity are pinned
+    // by the caller before this point, so the event cannot leak into another
+    // receiver configured in the same process.
+    async fn send(&self, endpoint: Endpoint, batch: String, node: String) {
         let event = self.get_json();
-        let current_date = OffsetDateTime::now_utc();
-        let index = format!("fim-{}-{}-{}", current_date.year(), current_date.month() as u8, current_date.day() );
+        debug!("Sending event '{}' to endpoint '{}' as {}, batch '{}'",
+            self.dbfile.id, endpoint.address, endpoint.principal(), batch);
 
         // Splunk endpoint integration
-        if cfg.endpoint_type == "Splunk" {
+        if endpoint.etype == "Splunk" {
             let data = json!({
-                "source": cfg.node,
+                "source": node,
                 "sourcetype": "_json",
                 "event": event,
                 "index": "fim_events"
             });
             debug!("Sending received event to Splunk integration, event: {}", data);
-            let request_url = format!("{}/services/collector/event", cfg.endpoint_address);
+            let request_url = format!("{}/services/collector/event", endpoint.address);
             let client = Client::builder()
-                .danger_accept_invalid_certs(cfg.insecure)
+                .danger_accept_invalid_certs(endpoint.insecure)
                 .timeout(Duration::from_secs(30))
                 .build().unwrap();
             match client
                 .post(request_url)
-                .header("Authorization", format!("Splunk {}", cfg.endpoint_token))
+                .header("Authorization", format!("Splunk {}", endpoint.token))
                 .json(&data)
                 .send()
                 .await {
                     Ok(response) => debug!("Response received: {:?}",
                         response.text().await.unwrap()),
-                    Err(e) => debug!("Error on request: {:?}", e)
+                    Err(e) => error!("Event '{}' could not be sent to endpoint '{}' (batch '{}'), Err: {:?}",
+                        self.dbfile.id, endpoint.address, batch, e)
             }
         // Elastic endpoint integration
         } else {
-            let request_url = format!("{}/{}/_doc/{}", cfg.endpoint_address, index, self.dbfile.id);
+            let request_url = format!("{}/{}/_doc/{}", endpoint.address, batch, self.dbfile.id);
             let client = Client::builder()
-                .danger_accept_invalid_certs(cfg.insecure)
+                .danger_accept_invalid_certs(endpoint.insecure)
                 .timeout(Duration::from_secs(30))
                 .build().unwrap();
             match client
                 .post(request_url)
-                .basic_auth(cfg.endpoint_user, Some(cfg.endpoint_pass))
+                .basic_auth(endpoint.user, Some(endpoint.pass))
                 .json(&event)
                 .send()
                 .await {
                     Ok(response) => debug!("Response received: {:?}",
                         response.text().await.unwrap()),
-                    Err(e) => debug!("Error on request: {:?}", e)
+                    Err(e) => error!("Event '{}' could not be sent to endpoint '{}' (batch '{}'), Err: {:?}",
+                        self.dbfile.id, endpoint.address, batch, e)
             }
         }
     }
@@ -106,13 +109,19 @@ impl HashEvent {
     // ------------------------------------------------------------------------
 
     pub async fn process(&self, cfg: AppConfig) {
+        // Pin the target endpoint, its credentials and the batch identity
+        // before sending, so the event keeps its original destination on
+        // retries and cannot be rerouted to another receiver.
+        let endpoint = cfg.get_endpoint();
+        let batch = appconfig::events_batch();
+        let node = cfg.node.clone();
         match cfg.get_events_destination().as_str() {
             appconfig::BOTH_MODE => {
                 self.log(cfg.clone());
-                self.send(cfg).await;
+                self.send(endpoint, batch, node).await;
             },
             appconfig::NETWORK_MODE => {
-                self.send(cfg).await;
+                self.send(endpoint, batch, node).await;
             },
             _ => self.log(cfg.clone())
         }

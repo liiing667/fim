@@ -17,10 +17,49 @@ use std::io::{Read, Write};
 use std::path::Path;
 use simplelog::LevelFilter;
 use std::sync::{Arc, Mutex};
+use time::OffsetDateTime;
 
 use crate::utils;
 use crate::integration::Integration;
 use crate::hash::ShaType;
+
+// ----------------------------------------------------------------------------
+
+// Pinned snapshot of a network receiver (target + credentials).
+// It is captured from the configuration before any event is sent, so events
+// produced for one receiver cannot be delivered to another receiver even if
+// several network endpoints are configured inside the same process.
+#[derive(Clone, Debug)]
+pub struct Endpoint {
+    pub etype: String,
+    pub address: String,
+    pub user: String,
+    pub pass: String,
+    pub token: String,
+    pub insecure: bool
+}
+
+impl Endpoint {
+
+    // Identity of the principal used to authenticate against the endpoint.
+    // It never exposes secret material, only who is used to authenticate.
+    pub fn principal(&self) -> String {
+        match self.token.is_empty() {
+            true => format!("user '{}'", self.user),
+            false => String::from("token credentials")
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
+
+// Batch identity shared by all events sent on the current day.
+// It matches the Elastic index name and tags every piece of evidence
+// (including send failures) with the batch it belongs to.
+pub fn events_batch() -> String {
+    let current_date = OffsetDateTime::now_utc();
+    format!("fim-{}-{}-{}", current_date.year(), current_date.month() as u8, current_date.day())
+}
 
 // ----------------------------------------------------------------------------
 
@@ -403,6 +442,22 @@ impl AppConfig {
 
     // ------------------------------------------------------------------------
 
+    // Pin a snapshot of the configured network endpoint (target and
+    // credentials). Callers capture it before sending events so the delivery
+    // cannot be rerouted or re-authenticated by a later configuration change.
+    pub fn get_endpoint(&self) -> Endpoint {
+        Endpoint {
+            etype: self.endpoint_type.clone(),
+            address: self.endpoint_address.clone(),
+            user: self.endpoint_user.clone(),
+            pass: self.endpoint_pass.clone(),
+            token: self.endpoint_token.clone(),
+            insecure: self.insecure
+        }
+    }
+
+    // ------------------------------------------------------------------------
+
     pub fn get_index(&self, raw_path: &str, cwd: &str, array: Array) -> usize {
         // Iterate over monitoring paths to match ignore string and ignore event or not
         match array.iter().position(|it| {
@@ -603,6 +658,59 @@ mod tests {
         assert_eq!(cfg.hashscanner_interval, cloned.hashscanner_interval);
         assert_eq!(cfg.hashscanner_algorithm, cloned.hashscanner_algorithm);
         assert_eq!(cfg.engine, cloned.engine);
+    }
+
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn test_get_endpoint() {
+        let cfg = create_test_config("info", "network");
+        let endpoint = cfg.get_endpoint();
+        assert_eq!(endpoint.etype, cfg.endpoint_type);
+        assert_eq!(endpoint.address, cfg.endpoint_address);
+        assert_eq!(endpoint.user, cfg.endpoint_user);
+        assert_eq!(endpoint.pass, cfg.endpoint_pass);
+        assert_eq!(endpoint.token, cfg.endpoint_token);
+        assert_eq!(endpoint.insecure, cfg.insecure);
+    }
+
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn test_get_endpoint_is_pinned() {
+        // The snapshot must keep the original target and credentials even if
+        // the configuration is changed afterwards (e.g. a second receiver).
+        let mut cfg = create_test_config("info", "network");
+        let endpoint = cfg.get_endpoint();
+        cfg.endpoint_address = String::from("another");
+        cfg.endpoint_user = String::from("another");
+        cfg.endpoint_pass = String::from("another");
+        cfg.endpoint_token = String::from("another");
+        assert_eq!(endpoint.address, String::from("test"));
+        assert_eq!(endpoint.user, String::from("test"));
+        assert_eq!(endpoint.pass, String::from("test"));
+        assert_eq!(endpoint.token, String::from("test"));
+    }
+
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn test_endpoint_principal() {
+        let mut cfg = create_test_config("info", "network");
+        cfg.endpoint_token = String::from("");
+        cfg.endpoint_user = String::from("watcher");
+        assert_eq!(cfg.get_endpoint().principal(), String::from("user 'watcher'"));
+        cfg.endpoint_token = String::from("secret");
+        assert_eq!(cfg.get_endpoint().principal(), String::from("token credentials"));
+    }
+
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn test_events_batch() {
+        let batch = events_batch();
+        assert!(batch.starts_with("fim-"));
+        assert_eq!(batch.matches('-').count(), 3);
     }
 
     // ------------------------------------------------------------------------

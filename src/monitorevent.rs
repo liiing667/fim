@@ -97,13 +97,15 @@ impl Event for MonitorEvent {
   // ------------------------------------------------------------------------
 
   // Function to send events through network
-  async fn send(&self, cfg: AppConfig) {
-        use time::OffsetDateTime;
-        let current_date = OffsetDateTime::now_utc();
-        let index = format!("fim-{}-{}-{}", current_date.year(), current_date.month() as u8, current_date.day() );
-        
+  // The target endpoint, its credentials and the batch identity are pinned
+  // by the caller before this point, so the event cannot leak into another
+  // receiver configured in the same process.
+  async fn send(&self, endpoint: Endpoint, batch: String) {
+        debug!("Sending event '{}' to endpoint '{}' as {}, batch '{}'",
+            self.id, endpoint.address, endpoint.principal(), batch);
+
         // Splunk endpoint integration
-        if cfg.endpoint_type == "Splunk" {
+        if endpoint.etype == "Splunk" {
             let data = json!({
                 "source": self.node.clone(),
                 "sourcetype": "_json",
@@ -124,20 +126,21 @@ impl Event for MonitorEvent {
                 "index": "fim_events"
             });
             debug!("Sending received event to Splunk integration, event: {}", data);
-            let request_url = format!("{}/services/collector/event", cfg.endpoint_address);
+            let request_url = format!("{}/services/collector/event", endpoint.address);
             let client = Client::builder()
-                .danger_accept_invalid_certs(cfg.insecure)
+                .danger_accept_invalid_certs(endpoint.insecure)
                 .timeout(Duration::from_secs(30))
                 .build().unwrap();
             match client
                 .post(request_url)
-                .header("Authorization", format!("Splunk {}", cfg.endpoint_token))
+                .header("Authorization", format!("Splunk {}", endpoint.token))
                 .json(&data)
                 .send()
                 .await {
                     Ok(response) => debug!("Response received: {:?}",
                         response.text().await.unwrap()),
-                    Err(e) => debug!("Error on request: {:?}", e)
+                    Err(e) => error!("Event '{}' could not be sent to endpoint '{}' (batch '{}'), Err: {:?}",
+                        self.id, endpoint.address, batch, e)
             }
         // Elastic endpoint integration
         } else {
@@ -155,20 +158,21 @@ impl Event for MonitorEvent {
                 "checksum": self.checksum.clone(),
                 "system": self.system.clone()
             });
-            let request_url = format!("{}/{}/_doc/{}", cfg.endpoint_address, index, self.id);
+            let request_url = format!("{}/{}/_doc/{}", endpoint.address, batch, self.id);
             let client = Client::builder()
-                .danger_accept_invalid_certs(cfg.insecure)
+                .danger_accept_invalid_certs(endpoint.insecure)
                 .timeout(Duration::from_secs(30))
                 .build().unwrap();
             match client
                 .post(request_url)
-                .basic_auth(cfg.endpoint_user, Some(cfg.endpoint_pass))
+                .basic_auth(endpoint.user, Some(endpoint.pass))
                 .json(&data)
                 .send()
                 .await {
                     Ok(response) => debug!("Response received: {:?}",
                         response.text().await.unwrap()),
-                    Err(e) => debug!("Error on request: {:?}", e)
+                    Err(e) => error!("Event '{}' could not be sent to endpoint '{}' (batch '{}'), Err: {:?}",
+                        self.id, endpoint.address, batch, e)
             }
         }
 
@@ -217,13 +221,18 @@ impl fmt::Debug for MonitorEvent {
 // ----------------------------------------------------------------------------
 
 pub async fn route(event: &MonitorEvent, cfg: AppConfig) {
+  // Pin the target endpoint, its credentials and the batch identity before
+  // sending, so the event keeps its original destination on retries and
+  // cannot be rerouted to another receiver configured in the same process.
+  let endpoint = cfg.get_endpoint();
+  let batch = appconfig::events_batch();
   match cfg.get_events_destination().as_str() {
       appconfig::BOTH_MODE => {
           event.log(cfg.clone());
-          event.send(cfg).await;
+          event.send(endpoint, batch).await;
       },
       appconfig::NETWORK_MODE => {
-          event.send(cfg).await;
+          event.send(endpoint, batch).await;
       },
       _ => event.log(cfg.clone())
   }
@@ -316,7 +325,7 @@ mod tests {
     fn test_send() {
         let evt = create_test_event();
         let cfg = AppConfig::new(&utils::get_os(), None);
-        block_on( evt.send(cfg) );
+        block_on( evt.send(cfg.get_endpoint(), appconfig::events_batch()) );
     }
 
     // ------------------------------------------------------------------------
@@ -325,7 +334,7 @@ mod tests {
     fn test_send_splunk() {
         let evt = create_test_event();
         let cfg = AppConfig::new(&utils::get_os(), Some("test/unit/config/common/test_send_splunk.yml"));
-        block_on( evt.send(cfg) );
+        block_on( evt.send(cfg.get_endpoint(), appconfig::events_batch()) );
     }
 
     // ------------------------------------------------------------------------

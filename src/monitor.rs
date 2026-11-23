@@ -9,7 +9,6 @@ use std::sync::mpsc;
 use log::{info, error, debug, warn};
 // To manage paths
 use std::path::Path;
-use time::OffsetDateTime;
 // To use intersperse()
 use itertools::Itertools;
 // Event handling
@@ -203,8 +202,8 @@ pub async fn monitor(
                     let event_path = Path::new(plain_path);
                     let event_filename = event_path.file_name().unwrap();
 
-                    let current_date = OffsetDateTime::now_utc();
-                    let index_name = format!("fim-{}-{}-{}", current_date.year(), current_date.month() as u8, current_date.day() );
+                    // Pin the batch identity of the events produced here
+                    let index_name = appconfig::events_batch();
                     let current_timestamp = utils::get_current_time_millis();
                     let kind: notify::EventKind = event.kind;
                     let path = event.paths[0].clone();

@@ -85,7 +85,7 @@ fn test_log() {
 fn test_send() {
     let evt = create_test_event();
     let cfg = AppConfig::new(&utils::get_os(), None);
-    block_on( evt.send(cfg) );
+    block_on( evt.send(cfg.get_endpoint(), appconfig::events_batch(), cfg.node.clone()) );
 }
 
 // ------------------------------------------------------------------------
@@ -95,7 +95,7 @@ fn test_send() {
 fn test_send_splunk() {
     let evt = create_test_event();
     let cfg = AppConfig::new(&utils::get_os(), Some("test/unit/config/common/test_send_splunk.yml"));
-    block_on( evt.send(cfg) );
+    block_on( evt.send(cfg.get_endpoint(), appconfig::events_batch(), cfg.node.clone()) );
 }
 
 // ------------------------------------------------------------------------
