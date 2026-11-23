@@ -17,10 +17,565 @@ use std::io::{Read, Write};
 use std::path::Path;
 use simplelog::LevelFilter;
 use std::sync::{Arc, Mutex};
+use std::fmt;
+use std::net::IpAddr;
+use serde::ser::{Serialize, SerializeStruct, Serializer};
 
 use crate::utils;
 use crate::integration::Integration;
 use crate::hash::ShaType;
+
+// ----------------------------------------------------------------------------
+
+pub const REDACTED: &str = "[REDACTED]";
+pub const NOT_DEFINED: &str = "Not_defined";
+
+// The authentication scheme that was accepted for an endpoint.  Keeping this
+// decision in one place prevents the config loader and the request builders
+// from making different assumptions about the same credentials.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EndpointAuth {
+    None,
+    Token,
+    Basic,
+}
+
+#[derive(Clone, Debug)]
+pub struct ConfigTrustError {
+    pub stage: &'static str,
+    pub target: String,
+    pub key: &'static str,
+    pub reason: &'static str,
+}
+
+impl ConfigTrustError {
+    fn new(stage: &'static str, target: &str, key: &'static str, reason: &'static str) -> Self {
+        ConfigTrustError {
+            stage,
+            target: String::from(target),
+            key,
+            reason,
+        }
+    }
+}
+
+impl fmt::Display for ConfigTrustError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let legacy_key = self.key.replace('.', "->");
+        write!(
+            f,
+            "config trust rejected [stage={}, target={}, key={} ({})]: {}; secret values are redacted",
+            self.stage, self.target, self.key, legacy_key, self.reason
+        )
+    }
+}
+
+// Values computed by the single admission/trust decision.  The AppConfig is
+// only populated after this succeeds, so a rejected config cannot leave a
+// partially constructed network integration behind.
+#[derive(Clone, Debug)]
+struct EndpointTrust {
+    destination: String,
+    address: String,
+    insecure: bool,
+    auth: EndpointAuth,
+    user: String,
+    pass: String,
+    token: String,
+    endpoint_type: String,
+}
+
+fn yaml_field<'a>(yaml: &'a Yaml, path: &[&str]) -> Option<&'a Yaml> {
+    let mut current = yaml;
+    for key in path {
+        current = current
+            .as_hash()?
+            .get(&Yaml::String((*key).to_string()))?;
+    }
+    Some(current)
+}
+
+fn optional_string(yaml: &Yaml, path: &[&str]) -> Result<Option<String>, ()> {
+    match yaml_field(yaml, path) {
+        None | Some(Yaml::Null) | Some(Yaml::BadValue) => Ok(None),
+        Some(Yaml::String(value)) => Ok(Some(value.trim().to_string())),
+        Some(_) => Err(()),
+    }
+}
+
+fn optional_bool(yaml: &Yaml, path: &[&str]) -> Result<Option<bool>, ()> {
+    match yaml_field(yaml, path) {
+        None | Some(Yaml::Null) | Some(Yaml::BadValue) => Ok(None),
+        Some(Yaml::Boolean(value)) => Ok(Some(*value)),
+        Some(Yaml::String(value)) => match value.trim().to_ascii_lowercase().as_str() {
+            "true" => Ok(Some(true)),
+            "false" => Ok(Some(false)),
+            _ => Err(()),
+        },
+        Some(_) => Err(()),
+    }
+}
+
+fn explicit_development_mode(yaml: &Yaml) -> bool {
+    let configured = matches!(optional_bool(yaml, &["development"]), Ok(Some(true)))
+        || matches!(optional_bool(yaml, &["development_mode"]), Ok(Some(true)))
+        || matches!(optional_bool(yaml, &["dev_mode"]), Ok(Some(true)))
+        || matches!(
+            optional_bool(yaml, &["events", "endpoint", "development"]),
+            Ok(Some(true))
+        )
+        || matches!(
+            optional_bool(yaml, &["events", "endpoint", "dev"]),
+            Ok(Some(true))
+        )
+        || matches!(
+            optional_bool(yaml, &["events", "endpoint", "dev_mode"]),
+            Ok(Some(true))
+        )
+        || matches!(
+            optional_bool(yaml, &["events", "endpoint", "allow_insecure"]),
+            Ok(Some(true))
+        );
+    configured || environment_development_mode()
+}
+
+fn environment_development_mode() -> bool {
+    ["FIM_DEV_MODE", "FIM_ALLOW_INSECURE", "FIM_INSECURE_DEV"]
+        .iter()
+        .any(|name| {
+            std::env::var(*name)
+                .map(|value| {
+                    matches!(
+                        value.trim().to_ascii_lowercase().as_str(),
+                        "1" | "true" | "yes" | "on"
+                    )
+                })
+                .unwrap_or(false)
+        })
+}
+
+fn endpoint_host(address: &str) -> Option<String> {
+    let value = address.trim();
+    let rest = match value.find("://") {
+        Some(position) => &value[position + 3..],
+        None => value,
+    };
+    let authority = rest.trim_end_matches('/').split('/').next()?;
+    let host = if authority.starts_with('[') {
+        let end = authority.find(']')?;
+        &authority[1..end]
+    } else {
+        authority.split(':').next()?
+    };
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_ascii_lowercase())
+    }
+}
+
+fn is_local_host(host: &str) -> bool {
+    if host == "localhost" || host == "0.0.0.0" {
+        return true;
+    }
+    match host.parse::<IpAddr>() {
+        Ok(address) => address.is_loopback() || address.is_unspecified(),
+        Err(_) => false,
+    }
+}
+
+fn is_defined_secret(value: &str) -> bool {
+    let value = value.trim();
+    !value.is_empty() && value != NOT_DEFINED
+}
+
+fn redacted_secret(value: &str) -> &'static str {
+    if is_defined_secret(value) {
+        REDACTED
+    } else {
+        NOT_DEFINED
+    }
+}
+
+fn redact_endpoint_address(address: &str) -> String {
+    let address = address.trim();
+    if address.is_empty() || address == NOT_DEFINED {
+        return String::from(address);
+    }
+
+    let without_userinfo = match (address.find("://"), address.find('@')) {
+        (Some(scheme), Some(at)) if at > scheme + 3 => {
+            format!("{}{}@{}", &address[..scheme + 3], REDACTED, &address[at + 1..])
+        },
+        (_, Some(_)) => String::from(REDACTED),
+        _ => String::from(address),
+    };
+
+    match without_userinfo.find('?') {
+        Some(position) => format!("{}?{}", &without_userinfo[..position], REDACTED),
+        None => without_userinfo,
+    }
+}
+
+// Return a canonical base URL used by every network integration.  Host-only
+// legacy addresses are treated as HTTPS, and a trailing slash never changes
+// the trust decision.  Cleartext HTTP is only accepted when the operator has
+// explicitly selected the insecure development option.
+fn normalized_base_url(address: &str, insecure: bool) -> Result<String, &'static str> {
+    let value = address.trim();
+    if value.is_empty() {
+        return Err("endpoint address is required");
+    }
+    if value.chars().any(|character| character.is_whitespace()) {
+        return Err("endpoint address must not contain whitespace");
+    }
+    if value.contains('@') {
+        return Err("credentials must not be embedded in the endpoint address");
+    }
+    if value.contains('?') || value.contains('#') {
+        return Err("endpoint address must not contain a query or fragment");
+    }
+
+    let (scheme, rest) = match value.find("://") {
+        Some(position) => (
+            value[..position].to_ascii_lowercase(),
+            &value[position + 3..],
+        ),
+        None => (
+            String::from(if insecure { "http" } else { "https" }),
+            value,
+        ),
+    };
+    if scheme != "https" && scheme != "http" {
+        return Err("endpoint address must use the http or https scheme");
+    }
+    if scheme == "http" && !insecure {
+        return Err("cleartext HTTP endpoint requires the explicit insecure development option");
+    }
+
+    let rest = rest.trim_end_matches('/');
+    if rest.is_empty() {
+        return Err("endpoint host is required");
+    }
+
+    let authority = rest.split('/').next().unwrap_or("");
+    let (host, port_suffix) = if authority.starts_with('[') {
+        match authority.find(']') {
+            Some(end) => {
+                let port = &authority[end + 1..];
+                if !port.is_empty() {
+                    if !port.starts_with(':')
+                        || port.len() == 1
+                        || !port[1..].chars().all(|value| value.is_ascii_digit())
+                    {
+                        return Err("endpoint port is invalid");
+                    }
+                }
+                (&authority[1..end], port)
+            },
+            None => return Err("endpoint host is invalid"),
+        }
+    } else {
+        match authority.split_once(':') {
+            Some((host, port)) => {
+                if port.is_empty() || !port.chars().all(|value| value.is_ascii_digit()) {
+                    return Err("endpoint port is invalid");
+                }
+                (host, &authority[host.len()..])
+            },
+            None => (authority, ""),
+        }
+    };
+    if host.is_empty() {
+        return Err("endpoint host is required");
+    }
+
+    let path = &rest[authority.len()..];
+    Ok(format!(
+        "{}://{}{}{}",
+        scheme,
+        host.to_ascii_lowercase(),
+        port_suffix,
+        path
+    ))
+}
+
+fn evaluate_trust(yaml: &Yaml) -> Result<EndpointTrust, ConfigTrustError> {
+    let target = match optional_string(yaml, &["events", "destination"]) {
+        Ok(Some(destination)) => {
+            match destination.trim().to_ascii_lowercase().as_str() {
+                "" | "file" => String::from("file"),
+                "network" => String::from("network"),
+                "both" => String::from("both"),
+                _ => {
+                    return Err(ConfigTrustError::new(
+                        "admission",
+                        "unknown",
+                        "events.destination",
+                        "unsupported events destination",
+                    ))
+                }
+            }
+        },
+        Ok(None) => String::from("file"),
+        Err(_) => {
+            return Err(ConfigTrustError::new(
+                "admission",
+                "unknown",
+                "events.destination",
+                "events destination must be a string",
+            ))
+        }
+    };
+
+    let configured_insecure = match optional_bool(yaml, &["events", "endpoint", "insecure"]) {
+        Ok(Some(value)) => value,
+        Ok(None) => false,
+        Err(_) if target == "file" => false,
+        Err(_) => {
+            return Err(ConfigTrustError::new(
+                "admission",
+                &target,
+                "events.endpoint.insecure",
+                "insecure must be a boolean or true/false string",
+            ))
+        }
+    };
+    let dev_mode = target != "file" && explicit_development_mode(yaml);
+    let insecure = configured_insecure || dev_mode;
+
+    // Local logging remains a first-class destination.  Endpoint material is
+    // ignored for trust purposes in file mode, which keeps legacy/local-only
+    // configuration working even when it contains a stale endpoint block.
+    if target == "file" {
+        let address = optional_string(yaml, &["events", "endpoint", "address"])
+            .ok()
+            .flatten()
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| String::from(NOT_DEFINED));
+        let token = optional_string(yaml, &["events", "endpoint", "credentials", "token"])
+            .ok()
+            .flatten()
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| String::from(NOT_DEFINED));
+        let user = optional_string(yaml, &["events", "endpoint", "credentials", "user"])
+            .ok()
+            .flatten()
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| String::from(NOT_DEFINED));
+        let pass = optional_string(yaml, &["events", "endpoint", "credentials", "password"])
+            .ok()
+            .flatten()
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| String::from(NOT_DEFINED));
+        let endpoint_type = if token != NOT_DEFINED {
+            String::from("Splunk")
+        } else if user != NOT_DEFINED && pass != NOT_DEFINED {
+            String::from("Elastic")
+        } else {
+            String::from(NOT_DEFINED)
+        };
+        return Ok(EndpointTrust {
+            destination: target,
+            address,
+            insecure,
+            auth: EndpointAuth::None,
+            user,
+            pass,
+            token,
+            endpoint_type,
+        });
+    }
+
+    let address = match optional_string(yaml, &["events", "endpoint", "address"]) {
+        Ok(Some(value)) if !value.is_empty() => value,
+        Ok(_) => {
+            return Err(ConfigTrustError::new(
+                "admission",
+                &target,
+                "events.endpoint.address",
+                "events->endpoint->address not found in config.yml. network target address is required",
+            ))
+        },
+        Err(_) => {
+            return Err(ConfigTrustError::new(
+                "admission",
+                &target,
+                "events.endpoint.address",
+                "endpoint address must be a string",
+            ))
+        }
+    };
+    if let Err(reason) = normalized_base_url(&address, insecure) {
+        return Err(ConfigTrustError::new(
+            "admission",
+            &target,
+            "events.endpoint.address",
+            reason,
+        ));
+    }
+    let address = address.trim_end_matches('/').to_string();
+
+    let token = match optional_string(yaml, &["events", "endpoint", "credentials", "token"]) {
+        Ok(value) => value,
+        Err(_) => {
+            return Err(ConfigTrustError::new(
+                "admission",
+                &target,
+                "events.endpoint.credentials.token",
+                "endpoint token must be a string",
+            ))
+        }
+    };
+    let user = match optional_string(yaml, &["events", "endpoint", "credentials", "user"]) {
+        Ok(value) => value,
+        Err(_) => {
+            return Err(ConfigTrustError::new(
+                "admission",
+                &target,
+                "events.endpoint.credentials.user",
+                "endpoint user must be a string",
+            ))
+        }
+    };
+    let pass = match optional_string(yaml, &["events", "endpoint", "credentials", "password"]) {
+        Ok(value) => value,
+        Err(_) => {
+            return Err(ConfigTrustError::new(
+                "admission",
+                &target,
+                "events.endpoint.credentials.password",
+                "endpoint password must be a string",
+            ))
+        }
+    };
+
+    let (auth, endpoint_type, user, pass, token) = match (token, user, pass) {
+        (Some(token), None, None) => {
+            if token.is_empty() {
+                return Err(ConfigTrustError::new(
+                    "admission",
+                    &target,
+                    "events.endpoint.credentials.token",
+                    "endpoint token must not be empty",
+                ));
+            }
+            if token == NOT_DEFINED {
+                return Err(ConfigTrustError::new(
+                    "admission",
+                    &target,
+                    "events.endpoint.credentials.token",
+                    "endpoint token uses a reserved placeholder",
+                ));
+            }
+            (
+                EndpointAuth::Token,
+                String::from("Splunk"),
+                String::from(NOT_DEFINED),
+                String::from(NOT_DEFINED),
+                token,
+            )
+        },
+        (Some(_), _, _) => {
+            return Err(ConfigTrustError::new(
+                "admission",
+                &target,
+                "events.endpoint.credentials",
+                "token and user/password are mutually exclusive",
+            ))
+        },
+        (None, Some(user), Some(pass)) => {
+            if user.is_empty() {
+                return Err(ConfigTrustError::new(
+                    "admission",
+                    &target,
+                    "events.endpoint.credentials.user",
+                    "endpoint user must not be empty",
+                ));
+            }
+            if pass.is_empty() {
+                return Err(ConfigTrustError::new(
+                    "admission",
+                    &target,
+                    "events.endpoint.credentials.password",
+                    "endpoint password must not be empty",
+                ));
+            }
+            if user == NOT_DEFINED || pass == NOT_DEFINED {
+                return Err(ConfigTrustError::new(
+                    "admission",
+                    &target,
+                    "events.endpoint.credentials",
+                    "endpoint credentials use a reserved placeholder",
+                ));
+            }
+            (
+                EndpointAuth::Basic,
+                String::from("Elastic"),
+                user,
+                pass,
+                String::from(NOT_DEFINED),
+            )
+        },
+        (None, Some(user), None) => {
+            return Err(ConfigTrustError::new(
+                "admission",
+                &target,
+                if user.is_empty() {
+                    "events.endpoint.credentials.user"
+                } else {
+                    "events.endpoint.credentials.password"
+                },
+                "events->endpoint->credentials->password not found in config.yml. No endpoint credentials provided in config.yml; user and password must be provided together",
+            ))
+        },
+        (None, None, Some(pass)) => {
+            return Err(ConfigTrustError::new(
+                "admission",
+                &target,
+                if pass.is_empty() {
+                    "events.endpoint.credentials.password"
+                } else {
+                    "events.endpoint.credentials.user"
+                },
+                "events->endpoint->credentials->user not found in config.yml. No endpoint credentials provided in config.yml; user and password must be provided together",
+            ))
+        },
+        (None, None, None) => {
+            return Err(ConfigTrustError::new(
+                "admission",
+                &target,
+                "events.endpoint.credentials",
+                "No endpoint credentials provided in config.yml; token or user/password is required for a network target",
+            ))
+        },
+    };
+
+    if insecure && !dev_mode {
+        let local_target = endpoint_host(&address)
+            .map(|host| is_local_host(&host))
+            .unwrap_or(false);
+        if !local_target {
+            return Err(ConfigTrustError::new(
+                "admission",
+                &target,
+                "events.endpoint.insecure",
+                "insecure endpoint requires an explicit development mode for non-local targets",
+            ));
+        }
+    }
+
+    Ok(EndpointTrust {
+        destination: target,
+        address,
+        insecure,
+        auth,
+        user,
+        pass,
+        token,
+        endpoint_type,
+    })
+}
 
 // ----------------------------------------------------------------------------
 
@@ -100,14 +655,20 @@ impl AppConfig {
         println!("[INFO] Loaded config from: '{}'", cfg);
         let yaml = read_config(cfg.clone());
 
-        // Manage null value on events->destination value
-        let events_destination = match yaml[0]["events"]["destination"].as_str() {
-            Some(value) => String::from(value),
-            None => {
-                println!("[WARN] events->destination not found in config.yml, using 'file'.");
-                String::from("file")
-            }
+        // Admission and integration construction use this exact decision.
+        let trust = match evaluate_trust(&yaml[0]) {
+            Ok(trust) => trust,
+            Err(error) => panic!("{}", error),
         };
+        if trust.insecure && trust.destination != "file" {
+            println!("[WARN] Insecure development endpoint mode enabled; TLS verification is disabled.");
+        }
+
+        // Manage null value on events->destination value
+        let events_destination = trust.destination.clone();
+        if yaml[0]["events"]["destination"].as_str().is_none() {
+            println!("[WARN] events->destination not found in config.yml, using 'file'.");
+        }
 
         // Manage value on events->watcher value
         let events_watcher = match yaml[0]["events"]["watcher"].as_str() {
@@ -117,13 +678,13 @@ impl AppConfig {
 
         // Manage null value on events->file value
         let events_file = match yaml[0]["events"]["file"].as_str() {
-            Some(value) => String::from(value),
-            None => {
+            Some(value) if !value.trim().is_empty() => String::from(value),
+            _ => {
                 if events_destination != *"network" {
                     println!("[ERROR] events->file not found in config.yml.");
                     panic!("events->file not found in config.yml.");
                 }else{
-                    String::from("Not_defined")
+                    String::from(NOT_DEFINED)
                 }
             }
         };
@@ -175,75 +736,17 @@ impl AppConfig {
             None => ShaType::Sha256
         };
 
-        // Manage null value on events->endpoint->insecure value
-        let insecure = match yaml[0]["events"]["endpoint"]["insecure"].as_bool() {
-            Some(value) => value,
-            None => {
-                if events_destination != *"file" {
-                    println!("[WARN] events->endpoint->insecure not found in config.yml, using 'false'.");
-                    false
-                }else{ false }
-            }
+        // Endpoint trust was resolved before any runtime integration exists.
+        let insecure = trust.insecure;
+        let endpoint_address = trust.address.clone();
+        let endpoint_token = trust.token.clone();
+        let endpoint_user = trust.user.clone();
+        let endpoint_pass = trust.pass.clone();
+        let endpoint_type = match trust.auth {
+            EndpointAuth::Token => String::from("Splunk"),
+            EndpointAuth::Basic => String::from("Elastic"),
+            EndpointAuth::None => trust.endpoint_type.clone(),
         };
-
-        // Manage null value on events->endpoint->address value
-        let endpoint_address = match yaml[0]["events"]["endpoint"]["address"].as_str() {
-            Some(value) => String::from(value),
-            None => {
-                if events_destination != *"file" {
-                    println!("[ERROR] events->endpoint->address not found in config.yml.");
-                    panic!("events->endpoint->address not found in config.yml.");
-                }else{
-                    String::from("Not_defined")
-                }
-            }
-        };
-
-        // Manage null value on events->endpoint->credentials->token value
-        let endpoint_token = match yaml[0]["events"]["endpoint"]["credentials"]["token"].as_str() {
-            Some(value) => String::from(value),
-            None => String::from("Not_defined")
-        };
-
-        // Manage null value on events->endpoint->credentials->user value
-        let endpoint_user = match yaml[0]["events"]["endpoint"]["credentials"]["user"].as_str() {
-            Some(value) => String::from(value),
-            None => {
-                if events_destination != *"file" && endpoint_token.is_empty() {
-                    println!("[ERROR] events->endpoint->credentials->user not found in config.yml.");
-                    panic!("events->endpoint->credentials->user not found in config.yml.");
-                }else{
-                    String::from("Not_defined")
-                }
-            }
-        };
-
-        // Manage null value on events->endpoint->credentials->password value
-        let endpoint_pass = match yaml[0]["events"]["endpoint"]["credentials"]["password"].as_str() {
-            Some(value) => String::from(value),
-            None => {
-                if events_destination != *"file" && endpoint_token.is_empty()  {
-                    println!("[ERROR] events->endpoint->credentials->password not found in config.yml.");
-                    panic!("events->endpoint->credentials->password not found in config.yml.");
-                }else{
-                    String::from("Not_defined")
-                }
-            }
-        };
-
-        let endpoint_type = if endpoint_token != "Not_defined" {
-            String::from("Splunk")
-        }else if endpoint_user != "Not_defined" && endpoint_pass != "Not_defined" {
-            String::from("Elastic")
-        }else{
-            String::from("Not_defined")
-        };
-
-        if endpoint_token == "Not_defined" && (endpoint_user == "Not_defined" ||
-            endpoint_pass == "Not_defined") && events_destination != *"file" {
-            println!("[ERROR] events->endpoint->credentials->[token or user and password] not found in config.yml.");
-            panic!("No endpoint credentials provided in config.yml.");
-        }
 
 
         // Manage null value on monitor value
@@ -393,7 +896,8 @@ impl AppConfig {
     // ------------------------------------------------------------------------
 
     pub fn get_events_destination(&self) -> String {
-        match self.events_destination.clone().as_str() {
+        let destination = self.events_destination.trim().to_ascii_lowercase();
+        match destination.as_str() {
             "both" => String::from(BOTH_MODE),
             "network" => String::from(NETWORK_MODE),
             // Default option is to log into file
@@ -468,20 +972,208 @@ impl AppConfig {
     // ------------------------------------------------------------------------
 
     pub fn get_integrations(&self, index: usize, array: Array) -> Vec<Integration> {
-        let default = array[index]["integrations"].clone().into_vec();
+        let entry = match array.get(index) {
+            Some(entry) => entry,
+            None => return Vec::new(),
+        };
+        let default = entry["integrations"].clone().into_vec();
         let data = default.unwrap_or_default();
-        let mut integrations: Vec<Integration> = Vec::new();
-        data.iter().for_each(|info|
-            integrations.push(Integration::new(
-                String::from(info["name"].as_str().unwrap()), 
-                info["condition"]
-                    .clone().into_vec().unwrap().iter().map(|element| 
-                        String::from(element.as_str().unwrap()) ).collect(), 
-                String::from(info["binary"].as_str().unwrap()), 
-                String::from(info["script"].as_str().unwrap()), 
-                String::from(info["parameters"].as_str().unwrap()) ))
-        );
-        integrations
+        data.iter()
+            .filter_map(|info| {
+                let name = info["name"].as_str()?.to_string();
+                let condition = info["condition"]
+                    .as_vec()?
+                    .iter()
+                    .map(|element| element.as_str().map(String::from))
+                    .collect::<Option<Vec<String>>>()?;
+                let binary = info["binary"].as_str()?.to_string();
+                let script = info["script"].as_str()?.to_string();
+                let parameters = info["parameters"].as_str().unwrap_or("").to_string();
+                let integration = Integration::new(name, condition, binary, script, parameters);
+                if integration.is_valid() {
+                    Some(integration)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    // ------------------------------------------------------------------------
+
+    pub fn is_network_destination(&self) -> bool {
+        match self.get_events_destination().as_str() {
+            NETWORK_MODE | BOTH_MODE => true,
+            _ => false,
+        }
+    }
+
+    // ------------------------------------------------------------------------
+
+    // The single authentication decision that all request builders consume.
+    pub fn endpoint_auth(&self) -> EndpointAuth {
+        if !self.is_network_destination() {
+            return EndpointAuth::None;
+        }
+        match self.endpoint_type.as_str() {
+            "Splunk" if is_defined_secret(&self.endpoint_token) => EndpointAuth::Token,
+            "Elastic" if is_defined_secret(&self.endpoint_user)
+                && is_defined_secret(&self.endpoint_pass) => EndpointAuth::Basic,
+            _ => EndpointAuth::None,
+        }
+    }
+
+    // ------------------------------------------------------------------------
+
+    pub fn endpoint_base_url(&self) -> Option<String> {
+        if !self.is_network_destination() {
+            return None;
+        }
+        normalized_base_url(&self.endpoint_address, self.insecure).ok()
+    }
+
+    // ------------------------------------------------------------------------
+
+    // Defensive check for consumers that receive an AppConfig from another
+    // path.  Config loading uses the same rules before this object exists.
+    pub fn endpoint_is_trusted(&self) -> bool {
+        if !self.is_network_destination() {
+            return true;
+        }
+        if normalized_base_url(&self.endpoint_address, self.insecure).is_err() {
+            return false;
+        }
+        match self.endpoint_auth() {
+            EndpointAuth::Token => {
+                !is_defined_secret(&self.endpoint_user)
+                    && !is_defined_secret(&self.endpoint_pass)
+            },
+            EndpointAuth::Basic => !is_defined_secret(&self.endpoint_token),
+            EndpointAuth::None => false,
+        }
+    }
+
+    // ------------------------------------------------------------------------
+
+    pub fn can_use_network(&self) -> bool {
+        self.is_network_destination() && self.endpoint_is_trusted()
+    }
+
+    // ------------------------------------------------------------------------
+
+    pub fn can_route_events(&self) -> bool {
+        !self.is_network_destination() || self.endpoint_is_trusted()
+    }
+
+    // ------------------------------------------------------------------------
+
+    pub fn redacted_endpoint_address(&self) -> String {
+        redact_endpoint_address(&self.endpoint_address)
+    }
+
+    // ------------------------------------------------------------------------
+
+    pub fn diagnostic_summary(&self) -> String {
+        format!("{:?}", self)
+    }
+
+    // ------------------------------------------------------------------------
+
+    pub fn redacted(&self) -> String {
+        self.diagnostic_summary()
+    }
+
+    // ------------------------------------------------------------------------
+
+    pub fn redacted_debug(&self) -> String {
+        self.diagnostic_summary()
+    }
+}
+
+// ----------------------------------------------------------------------------
+
+impl fmt::Debug for AppConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let address = self.redacted_endpoint_address();
+        f.debug_struct("AppConfig")
+            .field("version", &self.version)
+            .field("path", &self.path)
+            .field("events_watcher", &self.events_watcher)
+            .field("events_destination", &self.events_destination)
+            .field("events_max_file_checksum", &self.events_max_file_checksum)
+            .field("events_max_file_size", &self.events_max_file_size)
+            .field("checksum_algorithm", &self.checksum_algorithm)
+            .field("endpoint_type", &self.endpoint_type)
+            .field("endpoint_address", &address)
+            .field("endpoint_user", redacted_secret(&self.endpoint_user))
+            .field("endpoint_pass", redacted_secret(&self.endpoint_pass))
+            .field("endpoint_token", redacted_secret(&self.endpoint_token))
+            .field("events_file", &self.events_file)
+            .field("node", &self.node)
+            .field("log_file", &self.log_file)
+            .field("log_level", &self.log_level)
+            .field("log_max_file_size", &self.log_max_file_size)
+            .field("system", &self.system)
+            .field("insecure", &self.insecure)
+            .field("endpoint_trusted", &self.endpoint_is_trusted())
+            .field("hashscanner_file", &self.hashscanner_file)
+            .field("hashscanner_enabled", &self.hashscanner_enabled)
+            .field("hashscanner_interval", &self.hashscanner_interval)
+            .field("hashscanner_algorithm", &self.hashscanner_algorithm)
+            .field("engine", &self.engine)
+            .finish()
+    }
+}
+
+// ----------------------------------------------------------------------------
+
+impl fmt::Display for AppConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:?}", self)
+    }
+}
+
+// ----------------------------------------------------------------------------
+
+// Diagnostic serialization intentionally mirrors Debug: authentication
+// material is replaced before it can reach a log, console, or crash report.
+impl Serialize for AppConfig {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let address = self.redacted_endpoint_address();
+        let checksum_algorithm = format!("{:?}", self.checksum_algorithm);
+        let hashscanner_algorithm = format!("{:?}", self.hashscanner_algorithm);
+        let mut state = serializer.serialize_struct("AppConfig", 27)?;
+        state.serialize_field("version", &self.version)?;
+        state.serialize_field("path", &self.path)?;
+        state.serialize_field("events_watcher", &self.events_watcher)?;
+        state.serialize_field("events_destination", &self.events_destination)?;
+        state.serialize_field("events_max_file_checksum", &self.events_max_file_checksum)?;
+        state.serialize_field("events_max_file_size", &self.events_max_file_size)?;
+        state.serialize_field("checksum_algorithm", &checksum_algorithm)?;
+        state.serialize_field("endpoint_type", &self.endpoint_type)?;
+        state.serialize_field("endpoint_address", &address)?;
+        state.serialize_field("endpoint_user", redacted_secret(&self.endpoint_user))?;
+        state.serialize_field("endpoint_pass", redacted_secret(&self.endpoint_pass))?;
+        state.serialize_field("endpoint_token", redacted_secret(&self.endpoint_token))?;
+        state.serialize_field("events_file", &self.events_file)?;
+        state.serialize_field("monitor_count", &self.monitor.len())?;
+        state.serialize_field("audit_count", &self.audit.len())?;
+        state.serialize_field("node", &self.node)?;
+        state.serialize_field("log_file", &self.log_file)?;
+        state.serialize_field("log_level", &self.log_level)?;
+        state.serialize_field("log_max_file_size", &self.log_max_file_size)?;
+        state.serialize_field("system", &self.system)?;
+        state.serialize_field("insecure", &self.insecure)?;
+        state.serialize_field("endpoint_trusted", &self.endpoint_is_trusted())?;
+        state.serialize_field("hashscanner_file", &self.hashscanner_file)?;
+        state.serialize_field("hashscanner_enabled", &self.hashscanner_enabled)?;
+        state.serialize_field("hashscanner_interval", &self.hashscanner_interval)?;
+        state.serialize_field("hashscanner_algorithm", &hashscanner_algorithm)?;
+        state.serialize_field("engine", &self.engine)?;
+        state.end()
     }
 }
 
@@ -495,7 +1187,16 @@ pub fn read_config(path: String) -> Vec<Yaml> {
 
     file.read_to_string(&mut contents)
         .expect("Unable to read file");
-    YamlLoader::load_from_str(&contents).unwrap()
+    let yaml = YamlLoader::load_from_str(&contents).unwrap();
+    match yaml.get(0) {
+        Some(document) => {
+            if let Err(error) = evaluate_trust(document) {
+                panic!("{}", error);
+            }
+        },
+        None => panic!("(read_config): config file '{}' is empty", path),
+    }
+    yaml
 }
 
 // ----------------------------------------------------------------------------
@@ -1400,6 +2101,169 @@ mod tests {
     fn test_new_config_watcher() {
         let cfg = AppConfig::new("windows", Some("test/unit/config/windows/events_watcher.yml"));
         assert_eq!(cfg.events_watcher, "Poll");
+    }
+
+    // ------------------------------------------------------------------------
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn test_config_trust_rejects_missing_network_credentials() {
+        let result = std::panic::catch_unwind(|| {
+            AppConfig::new("linux", Some("test/unit/config/linux/trust_missing_credentials.yml"))
+        });
+        let panic = result.unwrap_err();
+        let message = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .unwrap_or("");
+        assert!(message.contains("events.endpoint.credentials"));
+        assert!(message.contains("stage=admission"));
+        assert!(message.contains("target=network"));
+    }
+
+    // ------------------------------------------------------------------------
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn test_config_trust_rejects_mixed_credentials() {
+        let result = std::panic::catch_unwind(|| {
+            AppConfig::new("linux", Some("test/unit/config/linux/trust_mixed_credentials.yml"))
+        });
+        let panic = result.unwrap_err();
+        let message = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .unwrap_or("");
+        assert!(message.contains("events.endpoint.credentials"));
+        assert!(message.contains("mutually exclusive"));
+        assert!(!message.contains("super-secret"));
+    }
+
+    // ------------------------------------------------------------------------
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn test_config_trust_rejects_default_cleartext_target() {
+        let result = std::panic::catch_unwind(|| {
+            AppConfig::new("linux", Some("test/unit/config/linux/trust_cleartext.yml"))
+        });
+        let panic = result.unwrap_err();
+        let message = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .unwrap_or("");
+        assert!(message.contains("events.endpoint.address"));
+        assert!(message.contains("cleartext HTTP"));
+    }
+
+    // ------------------------------------------------------------------------
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn test_config_trust_accepts_explicit_dev_target() {
+        let cfg = AppConfig::new(
+            "linux",
+            Some("test/unit/config/linux/trust_cleartext_dev.yml"),
+        );
+        assert!(cfg.can_use_network());
+        assert_eq!(
+            cfg.endpoint_base_url().unwrap(),
+            String::from("http://127.0.0.1:9200")
+        );
+    }
+
+    // ------------------------------------------------------------------------
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn test_config_trust_diagnostics_are_redacted() {
+        let cfg = AppConfig::new(
+            "linux",
+            Some("test/unit/config/linux/trust_valid_elastic.yml"),
+        );
+        assert!(cfg.can_use_network());
+
+        let debug = format!("{:?}", cfg);
+        assert!(!debug.contains("super-secret-password"));
+        assert!(debug.contains(REDACTED));
+
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(!json.contains("super-secret-password"));
+        assert!(json.contains(REDACTED));
+    }
+
+    // ------------------------------------------------------------------------
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn test_config_trust_restart_after_rejection_uses_complete_config() {
+        let rejected = std::panic::catch_unwind(|| {
+            AppConfig::new("linux", Some("test/unit/config/linux/trust_missing_credentials.yml"))
+        });
+        assert!(rejected.is_err());
+
+        let corrected = AppConfig::new(
+            "linux",
+            Some("test/unit/config/linux/trust_valid_splunk.yml"),
+        );
+        assert_eq!(corrected.events_destination, String::from("network"));
+        assert_eq!(corrected.endpoint_type, String::from("Splunk"));
+        assert!(corrected.can_use_network());
+    }
+
+    // ------------------------------------------------------------------------
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn test_config_trust_normalizes_target_presentation() {
+        let cfg = AppConfig::new(
+            "linux",
+            Some("test/unit/config/linux/trust_valid_elastic.yml"),
+        );
+        assert_eq!(
+            cfg.endpoint_base_url().unwrap(),
+            String::from("https://fim.example.test")
+        );
+
+        let splunk = AppConfig::new(
+            "linux",
+            Some("test/unit/config/linux/trust_valid_splunk.yml"),
+        );
+        assert_eq!(splunk.events_destination, String::from("network"));
+        assert_eq!(
+            splunk.endpoint_base_url().unwrap(),
+            String::from("https://fim.example.test")
+        );
+    }
+
+    // ------------------------------------------------------------------------
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn test_config_trust_rejects_insecure_remote_target() {
+        let result = std::panic::catch_unwind(|| {
+            AppConfig::new("linux", Some("test/unit/config/linux/trust_insecure_remote.yml"))
+        });
+        let panic = result.unwrap_err();
+        let message = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .unwrap_or("");
+        assert!(message.contains("events.endpoint.insecure"));
+        assert!(message.contains("explicit development mode"));
+    }
+
+    // ------------------------------------------------------------------------
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn test_config_trust_allows_remote_insecure_in_explicit_development() {
+        let cfg = AppConfig::new(
+            "linux",
+            Some("test/unit/config/linux/trust_insecure_remote_dev.yml"),
+        );
+        assert!(cfg.can_use_network());
+        assert!(cfg.insecure);
     }
 
 }

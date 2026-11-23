@@ -53,14 +53,26 @@ impl HashEvent {
     // ------------------------------------------------------------------------
 
     async fn send(&self, cfg: AppConfig) {
+        if !cfg.can_use_network() {
+            error!("Network event send skipped: endpoint did not pass the trust decision.");
+            return;
+        }
+        let base_url = match cfg.endpoint_base_url() {
+            Some(base_url) => base_url,
+            None => {
+                error!("Network event send skipped: endpoint target is incomplete.");
+                return;
+            }
+        };
         use time::OffsetDateTime;
 
         let event = self.get_json();
         let current_date = OffsetDateTime::now_utc();
         let index = format!("fim-{}-{}-{}", current_date.year(), current_date.month() as u8, current_date.day() );
 
+        match cfg.endpoint_auth() {
         // Splunk endpoint integration
-        if cfg.endpoint_type == "Splunk" {
+        EndpointAuth::Token => {
             let data = json!({
                 "source": cfg.node,
                 "sourcetype": "_json",
@@ -68,7 +80,7 @@ impl HashEvent {
                 "index": "fim_events"
             });
             debug!("Sending received event to Splunk integration, event: {}", data);
-            let request_url = format!("{}/services/collector/event", cfg.endpoint_address);
+            let request_url = format!("{}/services/collector/event", base_url);
             let client = Client::builder()
                 .danger_accept_invalid_certs(cfg.insecure)
                 .timeout(Duration::from_secs(30))
@@ -84,8 +96,9 @@ impl HashEvent {
                     Err(e) => debug!("Error on request: {:?}", e)
             }
         // Elastic endpoint integration
-        } else {
-            let request_url = format!("{}/{}/_doc/{}", cfg.endpoint_address, index, self.dbfile.id);
+        },
+        EndpointAuth::Basic => {
+            let request_url = format!("{}/{}/_doc/{}", base_url, index, self.dbfile.id);
             let client = Client::builder()
                 .danger_accept_invalid_certs(cfg.insecure)
                 .timeout(Duration::from_secs(30))
@@ -100,12 +113,20 @@ impl HashEvent {
                         response.text().await.unwrap()),
                     Err(e) => debug!("Error on request: {:?}", e)
             }
+        },
+        EndpointAuth::None => {
+            error!("Network event send skipped: endpoint authentication is incomplete.");
+        }
         }
     }
 
     // ------------------------------------------------------------------------
 
     pub async fn process(&self, cfg: AppConfig) {
+        if !cfg.can_route_events() {
+            error!("Event route rejected: configuration did not pass the trust decision.");
+            return;
+        }
         match cfg.get_events_destination().as_str() {
             appconfig::BOTH_MODE => {
                 self.log(cfg.clone());

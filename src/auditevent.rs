@@ -351,10 +351,22 @@ impl Event {
 
     // Function to send events through network
     pub async fn send(&self, index: String, cfg: AppConfig) {
+        if !cfg.can_use_network() {
+            error!("Network event send skipped: endpoint did not pass the trust decision.");
+            return;
+        }
+        let base_url = match cfg.endpoint_base_url() {
+            Some(base_url) => base_url,
+            None => {
+                error!("Network event send skipped: endpoint target is incomplete.");
+                return;
+            }
+        };
         let event = self.get_json();
         
+        match cfg.endpoint_auth() {
         // Splunk endpoint integration
-        if cfg.endpoint_type == "Splunk" {
+        EndpointAuth::Token => {
             let data = json!({
                 "source": self.node.clone(),
                 "sourcetype": "_json",
@@ -362,7 +374,7 @@ impl Event {
                 "index": "fim_events"
             });
             debug!("Sending received event to Splunk integration, event: {}", data);
-            let request_url = format!("{}/services/collector/event", cfg.endpoint_address);
+            let request_url = format!("{}/services/collector/event", base_url);
             let client = Client::builder()
                 .danger_accept_invalid_certs(cfg.insecure)
                 .timeout(Duration::from_secs(30))
@@ -378,8 +390,9 @@ impl Event {
                     Err(e) => debug!("Error on request: {:?}", e)
             }
         // Elastic endpoint integration
-        } else {
-            let request_url = format!("{}/{}/_doc/{}", cfg.endpoint_address, index, self.id);
+        },
+        EndpointAuth::Basic => {
+            let request_url = format!("{}/{}/_doc/{}", base_url, index, self.id);
             let client = Client::builder()
                 .danger_accept_invalid_certs(cfg.insecure)
                 .timeout(Duration::from_secs(30))
@@ -394,6 +407,10 @@ impl Event {
                         response.text().await.unwrap()),
                     Err(e) => debug!("Error on request: {:?}", e)
             }
+        },
+        EndpointAuth::None => {
+            error!("Network event send skipped: endpoint authentication is incomplete.");
+        }
         }
     }
 
@@ -401,6 +418,10 @@ impl Event {
 
     // Function to manage event destination
     pub async fn process(&self, destination: &str, index_name: String, cfg: AppConfig, ruleset: Ruleset){
+        if !cfg.can_route_events() {
+            error!("Event route rejected: configuration did not pass the trust decision.");
+            return;
+        }
         match destination {
             appconfig::BOTH_MODE => {
                 self.log(cfg.clone());

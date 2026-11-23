@@ -4,6 +4,7 @@ use crate::ruleset::Ruleset;
 use crate::appconfig::*;
 use crate::utils;
 use crate::db;
+use log::debug;
 
 
 pub fn init() -> (AppConfig, Ruleset) {
@@ -50,6 +51,7 @@ pub fn init() -> (AppConfig, Ruleset) {
     println!("[INFO] Configuration successfully read, forwarding output to log file.");
     println!("[INFO] Log file: '{}'", cfg.clone().log_file);
     println!("[INFO] Log level: '{}'", cfg.clone().log_level);
+    debug!("Loaded configuration: {:?}", cfg);
 
     let ruleset = Ruleset::new(utils::get_os(), None);
 

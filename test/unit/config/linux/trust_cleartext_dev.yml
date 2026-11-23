@@ -1,0 +1,20 @@
+node: "FIM"
+development: true
+
+events:
+  destination: network
+  endpoint:
+    address: http://127.0.0.1:9200/
+    credentials:
+      user: test_user
+      password: super-secret-password
+
+monitor:
+  - path: /tmp
+
+hashscanner:
+  file: /var/lib/fim/fim.db
+
+log:
+  file: /var/log/fim/fim.log
+  level: info

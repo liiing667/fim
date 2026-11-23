@@ -1,0 +1,18 @@
+node: "FIM"
+
+events:
+  destination: NETWORK
+  endpoint:
+    address: https://fim.example.test
+    credentials:
+      token: super-secret-token
+
+monitor:
+  - path: /tmp
+
+hashscanner:
+  file: /var/lib/fim/fim.db
+
+log:
+  file: /var/log/fim/fim.log
+  level: info

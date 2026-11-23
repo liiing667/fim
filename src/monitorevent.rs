@@ -98,12 +98,24 @@ impl Event for MonitorEvent {
 
   // Function to send events through network
   async fn send(&self, cfg: AppConfig) {
+        if !cfg.can_use_network() {
+            error!("Network event send skipped: endpoint did not pass the trust decision.");
+            return;
+        }
+        let base_url = match cfg.endpoint_base_url() {
+            Some(base_url) => base_url,
+            None => {
+                error!("Network event send skipped: endpoint target is incomplete.");
+                return;
+            }
+        };
         use time::OffsetDateTime;
         let current_date = OffsetDateTime::now_utc();
         let index = format!("fim-{}-{}-{}", current_date.year(), current_date.month() as u8, current_date.day() );
         
+        match cfg.endpoint_auth() {
         // Splunk endpoint integration
-        if cfg.endpoint_type == "Splunk" {
+        EndpointAuth::Token => {
             let data = json!({
                 "source": self.node.clone(),
                 "sourcetype": "_json",
@@ -124,7 +136,7 @@ impl Event for MonitorEvent {
                 "index": "fim_events"
             });
             debug!("Sending received event to Splunk integration, event: {}", data);
-            let request_url = format!("{}/services/collector/event", cfg.endpoint_address);
+            let request_url = format!("{}/services/collector/event", base_url);
             let client = Client::builder()
                 .danger_accept_invalid_certs(cfg.insecure)
                 .timeout(Duration::from_secs(30))
@@ -140,7 +152,8 @@ impl Event for MonitorEvent {
                     Err(e) => debug!("Error on request: {:?}", e)
             }
         // Elastic endpoint integration
-        } else {
+        },
+        EndpointAuth::Basic => {
             let data = json!({
                 "timestamp": self.timestamp.clone(),
                 "hostname": self.hostname.clone(),
@@ -155,7 +168,7 @@ impl Event for MonitorEvent {
                 "checksum": self.checksum.clone(),
                 "system": self.system.clone()
             });
-            let request_url = format!("{}/{}/_doc/{}", cfg.endpoint_address, index, self.id);
+            let request_url = format!("{}/{}/_doc/{}", base_url, index, self.id);
             let client = Client::builder()
                 .danger_accept_invalid_certs(cfg.insecure)
                 .timeout(Duration::from_secs(30))
@@ -170,6 +183,10 @@ impl Event for MonitorEvent {
                         response.text().await.unwrap()),
                     Err(e) => debug!("Error on request: {:?}", e)
             }
+        },
+        EndpointAuth::None => {
+            error!("Network event send skipped: endpoint authentication is incomplete.");
+        }
         }
 
     }
@@ -217,6 +234,10 @@ impl fmt::Debug for MonitorEvent {
 // ----------------------------------------------------------------------------
 
 pub async fn route(event: &MonitorEvent, cfg: AppConfig) {
+  if !cfg.can_route_events() {
+      error!("Event route rejected: configuration did not pass the trust decision.");
+      return;
+  }
   match cfg.get_events_destination().as_str() {
       appconfig::BOTH_MODE => {
           event.log(cfg.clone());

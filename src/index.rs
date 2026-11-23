@@ -41,12 +41,27 @@ fn get_template_path() -> String {
 // ----------------------------------------------------------------------------
 
 pub async fn push_template(cfg: AppConfig){
+    if !cfg.can_use_network() {
+        error!("Index template push skipped: endpoint did not pass the trust decision.");
+        return;
+    }
+    let base_url = match cfg.endpoint_base_url() {
+        Some(base_url) => base_url,
+        None => {
+            error!("Index template push skipped: endpoint target is incomplete.");
+            return;
+        }
+    };
+    if cfg.endpoint_auth() != EndpointAuth::Basic {
+        debug!("Index template is only supported by the Elastic/OpenSearch integration.");
+        return;
+    }
     let template_path = get_template_path();
     info!("Loaded index template from: {}", template_path);
     let file = File::open(template_path).await.unwrap();
     let stream = FramedRead::new(file, BytesCodec::new());
     let body = Body::wrap_stream(stream);
-    let url = format!("{}/_template/fim", cfg.endpoint_address);
+    let url = format!("{}/_template/fim", base_url);
 
     let client = Client::builder()
         .timeout(Duration::from_secs(120))

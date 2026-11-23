@@ -51,17 +51,47 @@ impl Integration {
 
     // ------------------------------------------------------------------------
 
+    // An integration is only usable when its matcher and executable are
+    // complete.  Invalid entries are ignored instead of being launched with
+    // partially parsed configuration.
+    pub fn is_executable(&self) -> bool {
+        !self.binary.trim().is_empty() && !self.script.trim().is_empty()
+    }
+
+    // ------------------------------------------------------------------------
+
+    pub fn is_valid(&self) -> bool {
+        let operator_valid = match self.condition.get(1).map(String::as_str) {
+            Some("==") | Some("!=") => true,
+            _ => false,
+        };
+        self.condition.len() >= 3
+            && operator_valid
+            && self.is_executable()
+    }
+
+    // ------------------------------------------------------------------------
+
     pub fn launch(&self, event: String) {
+        if !self.is_executable() {
+            warn!("Integration '{}' rejected before launch: executable is incomplete", self.name);
+            return;
+        }
         let formatted_event = match utils::get_os() {
             "windows" => format!("'{}'", event),
             _ => event
         };
-        let output = Command::new(self.binary.clone())
+        let output = match Command::new(self.binary.clone())
             .arg(self.script.clone())
             .arg(formatted_event)
             .arg(self.parameters.clone())
-            .output()
-            .expect("Failed to execute integration script");
+            .output() {
+                Ok(output) => output,
+                Err(error) => {
+                    warn!("Integration '{}' could not be executed: {}", self.name, error);
+                    return;
+                }
+            };
         debug!("Integration output: [{}]", String::from_utf8(output.stdout).unwrap());
         let stderr = String::from_utf8(output.stderr).unwrap();
         if !stderr.is_empty() { warn!("Integration error: '{}'", stderr) }
@@ -72,13 +102,24 @@ impl Integration {
 // ----------------------------------------------------------------------------
 
 pub fn get_event_integration(event: MonitorEvent, integrations: Vec<Integration>) -> Option<Integration> {
-    let option = integrations.iter().find(|integration|
-        match integration.condition[1].as_str() {
-            "==" => event.get_string(integration.condition[0].clone()) == integration.condition[2],
-            "!=" => event.get_string(integration.condition[0].clone()) != integration.condition[2],
-            _ => false
-        }
-    );
+    let option = integrations.iter()
+        .filter(|integration| integration.is_valid())
+        .find(|integration| {
+            let field = match integration.condition.get(0) {
+                Some(field) => field.clone(),
+                None => return false,
+            };
+            let expected = match integration.condition.get(2) {
+                Some(expected) => expected,
+                None => return false,
+            };
+            let actual = event.get_string(field);
+            match integration.condition.get(1).map(String::as_str) {
+                Some("==") => actual.as_str() == expected.as_str(),
+                Some("!=") => actual.as_str() != expected.as_str(),
+                _ => false
+            }
+        });
     option.map(|int| int.clone())
 }
 
