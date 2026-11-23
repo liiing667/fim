@@ -12,10 +12,6 @@ use std::path::Path;
 use time::OffsetDateTime;
 // To use intersperse()
 use itertools::Itertools;
-// Event handling
-use notify::event::{EventKind, AccessKind};
-
-
 // Utils functions
 use crate::utils;
 // Hashing functions
@@ -80,6 +76,57 @@ fn clean_audit_rules(cfg: &AppConfig){
 
 // ----------------------------------------------------------------------------
 
+async fn process_audit_log(cursor: &mut logreader::AuditCursor, cfg: &AppConfig,
+    destination: &str, index_name: &str, ruleset: &Ruleset) {
+    let mut resyncs = 0;
+    let mut iterations = 0;
+    loop {
+        iterations += 1;
+        if iterations > 10000 {
+            break;
+        }
+        match cursor.read_next(AppConfig::clone(cfg)) {
+            logreader::ReadOutcome::Event(audit_event) => {
+                resyncs = 0;
+                if !audit_event.is_empty() {
+                    // Getting the position of event in config (match ignore and labels)
+                    let index = cfg.get_index(audit_event.path.as_str(),
+                        audit_event.cwd.as_str(), cfg.audit.to_vec());
+
+                    if index != usize::MAX {
+                        // If event contains ignored string ignore event
+                        if !cfg.match_ignore(index, audit_event.file.as_str(), cfg.audit.to_vec()) &&
+                            !cfg.match_exclude(index, audit_event.path.as_str(), cfg.audit.to_vec()) &&
+                            cfg.match_allowed(index, audit_event.file.as_str(), cfg.audit.to_vec()) {
+                            audit_event.process(destination, String::from(index_name),
+                                AppConfig::clone(cfg), Ruleset::clone(ruleset)).await;
+                        }else{
+                            debug!("Event ignored/excluded not stored in alerts");
+                        }
+                    }else{
+                        debug!("Event not monitored by FIM");
+                    }
+                }
+                debug!("Event processed: {:?}", audit_event);
+                cursor.commit();
+            },
+            logreader::ReadOutcome::Skipped => {
+                resyncs = 0;
+                cursor.commit();
+            },
+            logreader::ReadOutcome::Pending => break,
+            logreader::ReadOutcome::Resync => {
+                resyncs += 1;
+                if resyncs > 8 {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
+
 // Function that monitorize files in loop
 pub async fn monitor(
     tx: mpsc::Sender<Result<notify::Event, notify::Error>>,
@@ -134,7 +181,7 @@ pub async fn monitor(
             };
         }
     }
-    let mut last_position = 0;
+    let mut audit_cursor: Option<logreader::AuditCursor> = None;
     if ! cfg.clone().audit.is_empty() && utils::get_os() == "linux" && utils::check_auditd() {
         for element in cfg.clone().audit {
             let path = element["path"].as_str().unwrap();
@@ -171,7 +218,9 @@ pub async fn monitor(
         }
         // Detect if Audit file is moved or renamed (rotation)
         watcher.watch(Path::new(logreader::AUDIT_PATH), RecursiveMode::NonRecursive).unwrap();
-        last_position = utils::get_file_end(logreader::AUDIT_LOG_PATH, 0);
+        // Start at the end of the current log, but keep the file identity so a
+        // later rotation starts from byte zero in the new file.
+        audit_cursor = Some(logreader::AuditCursor::new(logreader::AUDIT_LOG_PATH));
        
         // Remove auditd rules introduced by FIM
         // Setting ctrl + C handler
@@ -209,56 +258,12 @@ pub async fn monitor(
                     let kind: notify::EventKind = event.kind;
                     let path = event.paths[0].clone();
 
-                    // Reset reading position due to log rotation
-                    if plain_path == logreader::AUDIT_LOG_PATH && kind == EventKind::Access(AccessKind::Any) {
-                        last_position = 0;
-                    }
-
                     // If the event comes from audit.log
                     if plain_path == logreader::AUDIT_LOG_PATH {
-                        // Getting events from audit.log
-                        let mut events = Vec::new();
-                        let (log_event, position) = logreader::read_log(String::from(logreader::AUDIT_LOG_PATH), cfg.clone(), last_position, 0);
-                        if log_event.id != "0" { events.push(log_event); };
-                        let mut ctr = 0;
-                        last_position = position;
-                        while last_position < utils::get_file_end(logreader::AUDIT_LOG_PATH, 0) {
-                            debug!("Reading events, iteration: {}", ctr);
-                            let original_position = last_position;
-                            ctr += 1;
-                            let (evt, pos) = logreader::read_log(String::from(logreader::AUDIT_LOG_PATH), cfg.clone(), last_position, ctr);
-                            if evt.id != "0" {
-                                events.push(evt);
-                                ctr = 0;
-                            };
-                            last_position = pos;
-                            if original_position == pos {
-                                ctr = 0;
-                            }
-                        }
-                        debug!("Events read from audit log, position: {}", last_position);
-
-                        for audit_event in events {
-                            if ! audit_event.is_empty() {
-                                // Getting the position of event in config (match ignore and labels)
-                                let index = cfg.get_index(audit_event.clone().path.as_str(),
-                                    audit_event.clone().cwd.as_str(),
-                                    cfg.clone().audit.to_vec());
-
-                                if index != usize::MAX {
-                                    // If event contains ignored string ignore event
-                                    if ! cfg.match_ignore(index, audit_event.clone().file.as_str(), cfg.clone().audit)  &&
-                                        ! cfg.match_exclude(index, audit_event.clone().path.as_str(), cfg.clone().audit) &&
-                                        cfg.match_allowed(index, audit_event.clone().file.as_str(), cfg.clone().audit) {
-                                        audit_event.process(destination.clone().as_str(), index_name.clone(), cfg.clone(), ruleset.clone()).await;
-                                    }else{
-                                        debug!("Event ignored/excluded not stored in alerts");
-                                    }
-                                }else{
-                                    debug!("Event not monitored by FIM");
-                                }
-                            }
-                            debug!("Event processed: {:?}", audit_event.clone());
+                        if let Some(cursor) = audit_cursor.as_mut() {
+                            process_audit_log(cursor, &cfg, destination.as_str(),
+                                index_name.as_str(), &ruleset).await;
+                            debug!("Events read from audit log, position: {}", cursor.position());
                         }
                     }else {
                         let index = cfg.get_index(event_path.to_str().unwrap(), "", cfg.clone().monitor.to_vec());
