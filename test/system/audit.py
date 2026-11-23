@@ -56,6 +56,24 @@ def get_event(syscall=None, operation=None):
 
 # -----------------------------------------------------------------------------
 
+def get_file_events(filename):
+    events = []
+    with open(events_json, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            if 'file' in event and event['file'] == filename:
+                events.append(event)
+    return events
+
+
+# -----------------------------------------------------------------------------
+
 def remove(item):
     if os.path.exists(item):
         try:
@@ -105,6 +123,63 @@ class TestAuditd:
         else:
             event = get_event("257", "NORMAL")
         assert event is not None
+
+    # -------------------------------------------------------------------------
+
+    def test_audit_rotation_and_restart_recovery(self):
+        rounds_before = 3
+        rounds_down = 2
+
+        # Produce events while FIM is running, they are consumed on the fly.
+        for i in range(rounds_before):
+            open(test_file, 'w').close()
+            remove(test_file)
+        time.sleep(5)
+
+        # Disconnect: stop FIM, rotate the audit log and produce events
+        # while FIM is down (audit rule re-added manually since FIM removes
+        # its rules on stop).
+        subprocess.run(["systemctl", "stop", "fim"])
+        subprocess.run(["auditctl", "-w", "/tmp/test", "-k", "fim", "-p", "wax"])
+        rotate = subprocess.run(["service", "auditd", "rotate"])
+        if rotate.returncode != 0:
+            with open('/var/run/auditd.pid', 'r') as f:
+                subprocess.run(["kill", "-USR1", str(int(f.read()))])
+        time.sleep(3)
+
+        # The rotation produced old format shards (audit.log.1, ...).
+        shards = [f for f in os.listdir('/var/log/audit')
+            if f.startswith('audit.log.')]
+        assert len(shards) > 0
+
+        for i in range(rounds_down):
+            open(test_file, 'w').close()
+            remove(test_file)
+        time.sleep(3)
+
+        # Restart: FIM must recover the events produced while it was down,
+        # comparing the shard list with the persisted reading position.
+        subprocess.run(["systemctl", "start", "fim"])
+        expected = (rounds_before + rounds_down) * 2
+        events = []
+        for i in range(60):
+            time.sleep(1)
+            events = get_file_events('test_file')
+            if len(events) >= expected:
+                break
+
+        # Event count: no gap (missing events) and no replay (duplicated).
+        assert len(events) == expected
+        ids = [event['id'] for event in events]
+        assert len(ids) == len(set(ids))
+
+        # Recovery position: persisted as '<identity> <position>'.
+        position_file = '/var/lib/fim/audit.position'
+        assert os.path.exists(position_file)
+        with open(position_file, 'r') as f:
+            fields = f.read().split()
+        assert len(fields) == 2
+        assert int(fields[1]) > 0
 
     # -------------------------------------------------------------------------
 

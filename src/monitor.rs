@@ -13,8 +13,6 @@ use time::OffsetDateTime;
 // To use intersperse()
 use itertools::Itertools;
 // Event handling
-use notify::event::{EventKind, AccessKind};
-
 
 // Utils functions
 use crate::utils;
@@ -32,9 +30,43 @@ use crate::appevent::AppEvent;
 use crate::ruleset::*;
 // File reading continuously
 use crate::logreader;
+// Audit event type produced by the log reader
+use crate::auditevent::Event as AuditEvent;
 // integrations checker
 use crate::launcher;
 use crate::multiwatcher::MultiWatcher;
+
+// ----------------------------------------------------------------------------
+
+// Process a batch of audit events, filtering them through the configured
+// rules (ignore/exclude/allowed) before storing or forwarding them.
+async fn process_audit_events(events: Vec<AuditEvent>, destination: &str, cfg: AppConfig, ruleset: Ruleset) {
+    let current_date = OffsetDateTime::now_utc();
+    let index_name = format!("fim-{}-{}-{}", current_date.year(), current_date.month() as u8, current_date.day() );
+
+    for audit_event in events {
+        if ! audit_event.is_empty() {
+            // Getting the position of event in config (match ignore and labels)
+            let index = cfg.get_index(audit_event.clone().path.as_str(),
+                audit_event.clone().cwd.as_str(),
+                cfg.clone().audit.to_vec());
+
+            if index != usize::MAX {
+                // If event contains ignored string ignore event
+                if ! cfg.match_ignore(index, audit_event.clone().file.as_str(), cfg.clone().audit)  &&
+                    ! cfg.match_exclude(index, audit_event.clone().path.as_str(), cfg.clone().audit) &&
+                    cfg.match_allowed(index, audit_event.clone().file.as_str(), cfg.clone().audit) {
+                    audit_event.process(destination, index_name.clone(), cfg.clone(), ruleset.clone()).await;
+                }else{
+                    debug!("Event ignored/excluded not stored in alerts");
+                }
+            }else{
+                debug!("Event not monitored by FIM");
+            }
+        }
+        debug!("Event processed: {:?}", audit_event.clone());
+    }
+}
 
 // ----------------------------------------------------------------------------
 
@@ -135,6 +167,8 @@ pub async fn monitor(
         }
     }
     let mut last_position = 0;
+    let mut last_identity = 0;
+    let mut position_file = String::new();
     if ! cfg.clone().audit.is_empty() && utils::get_os() == "linux" && utils::check_auditd() {
         for element in cfg.clone().audit {
             let path = element["path"].as_str().unwrap();
@@ -171,8 +205,40 @@ pub async fn monitor(
         }
         // Detect if Audit file is moved or renamed (rotation)
         watcher.watch(Path::new(logreader::AUDIT_PATH), RecursiveMode::NonRecursive).unwrap();
-        last_position = utils::get_file_end(logreader::AUDIT_LOG_PATH, 0);
-       
+
+        // State file used to persist the audit reading position.
+        position_file = match Path::new(cfg.events_file.as_str()).parent() {
+            Some(parent) if ! parent.as_os_str().is_empty() =>
+                format!("{}/audit.position", parent.to_str().unwrap()),
+            _ => String::from("audit.position")
+        };
+
+        // Recover the reading state persisted before the last shutdown.
+        // Rotated shards not fully consumed are drained first, then the
+        // reading resumes from the stored offset, so a restart produces
+        // neither gaps (lost events) nor replays (duplicated events).
+        let checkpoint = logreader::load_checkpoint(position_file.as_str());
+        let plan = logreader::recover_reading(logreader::AUDIT_LOG_PATH, checkpoint);
+        for (shard, offset) in plan.pending.iter() {
+            info!("Recovering events from rotated shard '{}' starting at byte {}.", shard, offset);
+            let (events, _) = logreader::read_events(shard.as_str(), cfg.clone(), *offset);
+            process_audit_events(events, destination.as_str(), cfg.clone(), ruleset.clone()).await;
+        }
+        last_position = plan.position;
+        last_identity = plan.identity;
+
+        // Drain the events written to the live file while FIM was down,
+        // they would otherwise wait for the next file event to be read.
+        let (events, position) = logreader::read_events(
+            logreader::AUDIT_LOG_PATH, cfg.clone(), last_position);
+        last_position = position;
+        process_audit_events(events, destination.as_str(), cfg.clone(), ruleset.clone()).await;
+
+        if let Err(e) = logreader::store_checkpoint(position_file.as_str(),
+            logreader::Checkpoint::new(last_identity, last_position)) {
+            error!("Cannot store audit checkpoint, error: {}", e);
+        }
+
         // Remove auditd rules introduced by FIM
         // Setting ctrl + C handler
         let cloned_cfg = cfg.clone();
@@ -203,63 +269,55 @@ pub async fn monitor(
                     let event_path = Path::new(plain_path);
                     let event_filename = event_path.file_name().unwrap();
 
-                    let current_date = OffsetDateTime::now_utc();
-                    let index_name = format!("fim-{}-{}-{}", current_date.year(), current_date.month() as u8, current_date.day() );
                     let current_timestamp = utils::get_current_time_millis();
                     let kind: notify::EventKind = event.kind;
                     let path = event.paths[0].clone();
 
-                    // Reset reading position due to log rotation
-                    if plain_path == logreader::AUDIT_LOG_PATH && kind == EventKind::Access(AccessKind::Any) {
-                        last_position = 0;
-                    }
-
                     // If the event comes from audit.log
                     if plain_path == logreader::AUDIT_LOG_PATH {
-                        // Getting events from audit.log
                         let mut events = Vec::new();
-                        let (log_event, position) = logreader::read_log(String::from(logreader::AUDIT_LOG_PATH), cfg.clone(), last_position, 0);
-                        if log_event.id != "0" { events.push(log_event); };
-                        let mut ctr = 0;
-                        last_position = position;
-                        while last_position < utils::get_file_end(logreader::AUDIT_LOG_PATH, 0) {
-                            debug!("Reading events, iteration: {}", ctr);
-                            let original_position = last_position;
-                            ctr += 1;
-                            let (evt, pos) = logreader::read_log(String::from(logreader::AUDIT_LOG_PATH), cfg.clone(), last_position, ctr);
-                            if evt.id != "0" {
-                                events.push(evt);
-                                ctr = 0;
-                            };
-                            last_position = pos;
-                            if original_position == pos {
-                                ctr = 0;
+
+                        // Detect rotation by file identity. When the file we
+                        // were reading is replaced, drain its unread tail from
+                        // the rotated shards before resetting the position, so
+                        // no audit evidence is lost at the rotation boundary.
+                        let current_identity = logreader::get_file_identity(logreader::AUDIT_LOG_PATH);
+                        if current_identity != 0 && last_identity != 0 &&
+                            current_identity != last_identity {
+                            info!("Audit log rotation detected, draining rotated shards.");
+                            let plan = logreader::recover_reading(logreader::AUDIT_LOG_PATH,
+                                Some(logreader::Checkpoint::new(last_identity, last_position)));
+                            for (shard, offset) in plan.pending.iter() {
+                                let (mut drained, _) =
+                                    logreader::read_events(shard.as_str(), cfg.clone(), *offset);
+                                events.append(&mut drained);
                             }
+                            last_position = plan.position;
+                            last_identity = plan.identity;
                         }
+
+                        // If the file shrank below the last position (external
+                        // truncation) start over from the beginning instead of
+                        // seeking past the end of the file.
+                        if last_position > utils::get_file_end(logreader::AUDIT_LOG_PATH, 0) {
+                            last_position = 0;
+                        }
+
+                        // Getting events from audit.log
+                        let (mut read, position) = logreader::read_events(
+                            logreader::AUDIT_LOG_PATH, cfg.clone(), last_position);
+                        events.append(&mut read);
+                        last_position = position;
+                        last_identity = logreader::get_file_identity(logreader::AUDIT_LOG_PATH);
                         debug!("Events read from audit log, position: {}", last_position);
 
-                        for audit_event in events {
-                            if ! audit_event.is_empty() {
-                                // Getting the position of event in config (match ignore and labels)
-                                let index = cfg.get_index(audit_event.clone().path.as_str(),
-                                    audit_event.clone().cwd.as_str(),
-                                    cfg.clone().audit.to_vec());
-
-                                if index != usize::MAX {
-                                    // If event contains ignored string ignore event
-                                    if ! cfg.match_ignore(index, audit_event.clone().file.as_str(), cfg.clone().audit)  &&
-                                        ! cfg.match_exclude(index, audit_event.clone().path.as_str(), cfg.clone().audit) &&
-                                        cfg.match_allowed(index, audit_event.clone().file.as_str(), cfg.clone().audit) {
-                                        audit_event.process(destination.clone().as_str(), index_name.clone(), cfg.clone(), ruleset.clone()).await;
-                                    }else{
-                                        debug!("Event ignored/excluded not stored in alerts");
-                                    }
-                                }else{
-                                    debug!("Event not monitored by FIM");
-                                }
-                            }
-                            debug!("Event processed: {:?}", audit_event.clone());
+                        // Persist the reading state to recover it on restart.
+                        if let Err(e) = logreader::store_checkpoint(position_file.as_str(),
+                            logreader::Checkpoint::new(last_identity, last_position)) {
+                            error!("Cannot store audit checkpoint, error: {}", e);
                         }
+
+                        process_audit_events(events, destination.as_str(), cfg.clone(), ruleset.clone()).await;
                     }else {
                         let index = cfg.get_index(event_path.to_str().unwrap(), "", cfg.clone().monitor.to_vec());
                         let parent = match event_path.is_dir() {
