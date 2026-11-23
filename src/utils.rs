@@ -132,18 +132,41 @@ pub fn open_file(file: &str, itx: u64) -> File {
 
 // ----------------------------------------------------------------------------
 
+pub fn auditctl_binary() -> Option<String> {
+    // An explicit override is useful for packaged deployments and for tests
+    // that provide a controlled auditctl implementation.
+    for variable in ["FIM_AUDITCTL", "AUDITCTL", "AUDITCTL_PATH", "FIM_AUDITCTL_PATH"] {
+        if let Ok(value) = env::var(variable) {
+            if !value.trim().is_empty() {
+                return Some(value);
+            }
+        }
+    }
+
+    if let Ok(path) = env::var("PATH") {
+        for directory in env::split_paths(&path) {
+            let candidate = directory.join(if cfg!(windows) { "auditctl.exe" } else { "auditctl" });
+            if candidate.is_file() {
+                return Some(candidate.to_string_lossy().into_owned());
+            }
+        }
+    }
+
+    for candidate in ["/usr/sbin/auditctl", "/sbin/auditctl"] {
+        if Path::new(candidate).is_file() {
+            return Some(String::from(candidate));
+        }
+    }
+    None
+}
+
 pub fn check_auditd() -> bool {
-    match Command::new("which")
-        .arg("auditctl")
-        .output()
-        .expect("[ERROR] Failed to execute auditctl command check")
-        .status
-        .success() {
-        true => {
-            debug!("Auditctl command available");
+    match auditctl_binary() {
+        Some(binary) => {
+            debug!("Auditctl command available: '{}'", binary);
             true
         },
-        _ => {
+        None => {
             warn!("Auditctl command unavailable");
             false
         }
@@ -265,17 +288,51 @@ pub fn get_audit_rule_permissions(value: Option<&str>) -> String {
 
 // ----------------------------------------------------------------------------
 
-pub fn run_auditctl(args: &[&str]) {
-    let auditctl_path = if Path::new("/usr/sbin/auditctl").exists() { "/usr/sbin/auditctl"
-    } else { "/sbin/auditctl" };
-
-    match Command::new(auditctl_path)
-    .args(args)
-    .output()
-    {
-        Ok(d) => debug!("Auditctl command info: {:?}", d),
-        Err(e) => error!("Auditctl command error: {}", e)
+/// Run auditctl and return its standard output when the command succeeds.
+/// The error includes the command, exit status and stderr so callers can
+/// preserve the actual policy stage in failure evidence.
+pub fn run_auditctl_output(args: &[&str]) -> Result<String, String> {
+    let auditctl_path = match auditctl_binary() {
+        Some(path) => path,
+        None => return Err(String::from("auditctl command unavailable")),
     };
+
+    match Command::new(&auditctl_path).args(args).output() {
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+            if output.status.success() {
+                debug!(
+                    "Auditctl command '{} {:?}' info: stdout='{}' stderr='{}'",
+                    auditctl_path, args, stdout, stderr
+                );
+                Ok(stdout)
+            } else {
+                let message = format!(
+                    "auditctl '{}' {:?} failed with status '{}': {}",
+                    auditctl_path,
+                    args,
+                    output.status,
+                    stderr.trim()
+                );
+                error!("{}", message);
+                Err(message)
+            }
+        }
+        Err(error) => {
+            let message = format!(
+                "auditctl '{}' {:?} could not be executed: {}",
+                auditctl_path, args, error
+            );
+            error!("{}", message);
+            Err(message)
+        }
+    }
+}
+
+/// Backwards compatible helper for call sites that only need the exit status.
+pub fn run_auditctl(args: &[&str]) -> bool {
+    run_auditctl_output(args).is_ok()
 }
 
 // ----------------------------------------------------------------------------

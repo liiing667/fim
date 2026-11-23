@@ -26,6 +26,8 @@ mod ruleevent;
 // File reading continuously
 mod logreader;
 mod auditevent;
+// Manage audit rule ownership and lifecycle
+mod auditrules;
 // Manage Windows service
 #[cfg(target_os = "windows")]
 mod service;

@@ -35,6 +35,8 @@ use crate::logreader;
 // integrations checker
 use crate::launcher;
 use crate::multiwatcher::MultiWatcher;
+// audit rule ownership and lifecycle
+use crate::auditrules;
 
 // ----------------------------------------------------------------------------
 
@@ -69,13 +71,45 @@ async fn push_template(destination: &str, cfg: AppConfig){
 
 // ----------------------------------------------------------------------------
 
-fn clean_audit_rules(cfg: &AppConfig){
-    for element in cfg.audit.clone() {
-        let path = element["path"].as_str().unwrap();
-        let rule = utils::get_audit_rule_permissions(element["rule"].as_str());
-        utils::run_auditctl(&["-W", path, "-k", "fim", "-p", &rule]);
+/// Install the current configuration generation and remove only rules that a
+/// previous generation of this FIM instance owned.  External/handwritten
+/// rules are never part of the ownership set, so they survive both restart and
+/// configuration changes.
+pub fn setup_audit_rules(cfg: &AppConfig) -> Result<auditrules::AuditRuleReport, String> {
+    debug!(
+        "Audit rule ownership state: '{}'",
+        auditrules::state_path(cfg).display()
+    );
+    match auditrules::sync_audit_rules(cfg) {
+        Ok(report) => {
+            info!(
+                "Audit rules synchronized (generation {}): added={}, removed={}, snapshot={}",
+                report.generation,
+                report.added.len(),
+                report.removed.len(),
+                report.after.len()
+            );
+            Ok(report)
+        }
+        Err(error) => {
+            error!("{}", error);
+            Err(error.to_string())
+        }
     }
-    std::process::exit(0);
+}
+
+/// Remove the rules owned by this instance.  This intentionally does not use
+/// the current configuration as a delete list: doing so could delete a
+/// handwritten rule that happens to share a path with a former FIM rule.
+pub fn clean_audit_rules(cfg: &AppConfig) {
+    match auditrules::remove_owned_audit_rules(cfg) {
+        Ok(report) => info!(
+            "Owned audit rules removed: {} (snapshot={})",
+            report.removed.len(),
+            report.after.len()
+        ),
+        Err(error) => error!("Could not remove owned audit rules: {}", error),
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -134,12 +168,30 @@ pub async fn monitor(
             };
         }
     }
+    let auditd_available = utils::get_os() == "linux" && utils::check_auditd();
+
+    // Reconcile even when the audit section is empty: this is what removes
+    // rules left behind by a previous configuration.  The function commits the
+    // ownership state only after every add/remove has succeeded.
+    if auditd_available {
+        if let Err(error) = setup_audit_rules(&cfg) {
+            error!(
+                "Audit rule generation was not committed, keeping the previous complete set: {}",
+                error
+            );
+        }
+    }
+
     let mut last_position = 0;
-    if ! cfg.clone().audit.is_empty() && utils::get_os() == "linux" && utils::check_auditd() {
+    if ! cfg.clone().audit.is_empty() && auditd_available {
         for element in cfg.clone().audit {
-            let path = element["path"].as_str().unwrap();
-            let rule = utils::get_audit_rule_permissions(element["rule"].as_str());
-            utils::run_auditctl(&["-w", path, "-k", "fim", "-p", &rule]);
+            let path = match element["path"].as_str() {
+                Some(path) => path,
+                None => {
+                    warn!("Ignoring audit entry without a valid path.");
+                    continue;
+                }
+            };
             info!("Checking audit path: {}", path);
 
             match element["allowed"].as_vec() {
@@ -170,13 +222,27 @@ pub async fn monitor(
             };
         }
         // Detect if Audit file is moved or renamed (rotation)
-        watcher.watch(Path::new(logreader::AUDIT_PATH), RecursiveMode::NonRecursive).unwrap();
+        match watcher.watch(Path::new(logreader::AUDIT_PATH), RecursiveMode::NonRecursive) {
+            Ok(_) => debug!("Watching audit log directory: '{}'", logreader::AUDIT_PATH),
+            Err(error) => warn!(
+                "Could not watch audit log directory '{}': {}",
+                logreader::AUDIT_PATH,
+                error
+            )
+        }
         last_position = utils::get_file_end(logreader::AUDIT_LOG_PATH, 0);
-       
-        // Remove auditd rules introduced by FIM
-        // Setting ctrl + C handler
+    }
+
+    // Remove auditd rules introduced by FIM.  The handler is also needed when
+    // the current configuration is empty but a failed reconciliation left the
+    // previous owned set in place.
+    if auditd_available &&
+        (!cfg.clone().audit.is_empty() || auditrules::has_owned_audit_rules(&cfg)) {
         let cloned_cfg = cfg.clone();
-        match ctrlc::set_handler(move || clean_audit_rules(&cloned_cfg)) {
+        match ctrlc::set_handler(move || {
+            clean_audit_rules(&cloned_cfg);
+            std::process::exit(0);
+        }) {
             Ok(_v) => debug!("Handler Ctrl-C set and listening"),
             Err(e) => error!("Error setting Ctrl-C handler, the process will continue without signal handling, Error: '{}'", e)
         }

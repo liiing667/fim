@@ -260,7 +260,18 @@ impl AppConfig {
                     panic!("Audit only supported in Linux systems.");
                 }
                 engine = String::from("audit");
-                value.to_vec()
+                // Freeze the accepted audit generation at config load time.
+                // Entries without a usable path cannot be installed or
+                // matched later, so they must not become part of the current
+                // monitoring set.
+                let mut accepted = Vec::new();
+                for element in value.iter() {
+                    match element["path"].as_str() {
+                        Some(path) if !path.trim().is_empty() => accepted.push(element.clone()),
+                        _ => println!("[WARN] Ignoring audit rule without a valid path.")
+                    }
+                }
+                accepted
             },
             None => {
                 if monitor.is_empty() {
